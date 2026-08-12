@@ -4,6 +4,7 @@ description: Map a live app into Epics and Stories, and design a modular test ar
 tools:
   - mcp__testbots-mcp-server__get_context
   - mcp__testbots-mcp-server__crawl_url
+  - mcp__testbots-mcp-server__list_websites
   - mcp__testbots-mcp-server__create_website
   - mcp__testbots-mcp-server__create_page
   - mcp__testbots-mcp-server__add_locators

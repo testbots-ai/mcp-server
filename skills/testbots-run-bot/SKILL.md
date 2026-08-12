@@ -12,6 +12,9 @@ tools:
   - mcp__testbots-mcp-server__get_job_status
   - mcp__testbots-mcp-server__list_recent_runs
   - mcp__testbots-mcp-server__get_execution_report
+  - mcp__testbots-mcp-server__get_page_by_url
+  - mcp__testbots-mcp-server__crawl_url
+  - mcp__testbots-mcp-server__heal_locator
 ---
 
 ## When to use this skill

@@ -10,6 +10,10 @@ tools:
   - mcp__testbots-mcp-server__create_story
   - mcp__testbots-mcp-server__search_step_templates
   - mcp__testbots-mcp-server__get_step_template
+  - mcp__testbots-mcp-server__crawl_url
+  - mcp__testbots-mcp-server__get_page_by_url
+  - mcp__testbots-mcp-server__list_branches
+  - mcp__testbots-mcp-server__create_branch
   - mcp__testbots-mcp-server__create_test_script
   - mcp__testbots-mcp-server__create_suite
   - mcp__testbots-mcp-server__add_scripts_to_suite
@@ -68,8 +72,9 @@ generated from it — no live app/URL involved.
      placeholder. Only leave a single descriptive placeholder step (flagged as needing manual
      locator/template work) when no concrete UI target or URL is known at all — never guess a raw
      selector as a substitute.
-   - See CLAUDE.md's "TestStep shape" section for the exact, proven-working shape. In short: each
-     step needs `templateId` + `templateTitle` (built-ins only) + a `parameters` array (NOT
+   - Build each step in the exact shape below — it is the proven-working one, and the near-miss
+     variants fail in ways that look like success. Each step needs `templateId` +
+     `templateTitle` (built-ins only) + a `parameters` array (NOT
      `params`) with one entry per `{{placeholder}}` in `templateTitle` — `{"key": "ui-locator",
      "value": {"locatorId": "<real id>"}, "paramClass":
      "ai.automationhq.commons.entities.assets.UILocator"}` for element targets (never fabricate
@@ -117,8 +122,9 @@ generated from it — no live app/URL involved.
   step that verifies the result, insert a wait step** — `template-id-36` ("Wait for visibility of
   {{ui-locator}} for {{number}} seconds", preferred when a destination-page locator is known) or
   `template-id-35` ("Wait for {{number}} seconds", plain fixed delay ~5-10s otherwise). Skipping
-  this causes the verify step to run before the page has navigated and fail — see CLAUDE.md's
-  "Post-navigation race" section.
+  this causes the verify step to run before the page has navigated and fail: the URL/element
+  check is a single immediate read with no retry loop, so it sees the page the click was meant
+  to leave.
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
 - Always show the traceability matrix before writing scripts, not just in the final summary
 - If the file has an `error` from `extract_requirements`, do not retry — report it to the user

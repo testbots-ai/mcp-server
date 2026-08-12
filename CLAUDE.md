@@ -956,11 +956,17 @@ advertised.
   tools, since an empty tool list reads as a broken server.
 - `get_context` is injected into every profile regardless of spec.
 
-**`core` (58 tools — roughly half of `full`) is defined as "every bundled skill keeps
-working"**, not as a taste judgment. `test_every_skill_works_under_the_core_profile` reads each
-`SKILL.md`'s own `tools:` frontmatter and fails if any declared tool falls outside `core`. If a
-skill gains a dependency, either bring the tool into `core` or move the skill out — do not delete
-the assertion. A half-running skill is worse than a long tool list.
+**`core` (61 tools — roughly half of `full`) is defined as "every bundled skill keeps
+working"**, not as a taste judgment. Two tests hold that definition, and both are needed:
+`test_every_skill_works_under_the_core_profile` reads each `SKILL.md`'s own `tools:` frontmatter,
+and `test_core_covers_every_tool_the_skill_bodies_name` reads the prose. The frontmatter is
+hand-maintained and drifts from what the workflow actually instructs — checking only the
+declaration is how `list_branches`/`commit_branch` sat outside `core` while the test stayed green,
+leaving both generation skills telling the model to offer the real branches with no tool to list
+them, so it fell back to the protected `main` that rule exists to avoid. A tool the body merely
+*names* is still a dependency: the model stops at that sentence either way. If a skill gains a
+dependency, bring the tool into `core` or move the skill out — do not delete either assertion.
+A half-running skill is worse than a long tool list.
 
 **Filtering is presentation, not authorization.** `_dispatch` stays permissive, so a hidden tool
 still executes if a client calls it anyway; the security boundary is the AHQ token, which the
@@ -971,8 +977,8 @@ gateway re-validates on every call. Never use a profile to withhold a destructiv
 appear in any profile. Kept as a name→group table rather than a field on each `Tool` so adding a
 tool is a one-line edit and doesn't conflict with every branch in flight.
 
-Measured 2026-08-05: `full` 138 tools / ~65.7k chars / ~16.4k tokens; `core` 58 tools /
-~36.7k chars / ~9.2k tokens. Measure with `model_dump(exclude_none=True, by_alias=True)` and compact JSON
+Measured: `full` 138 tools / ~65.7k chars / ~16.4k tokens; `core` 61 tools /
+~38.2k chars / ~9.6k tokens. Measure with `model_dump(exclude_none=True, by_alias=True)` and compact JSON
 separators — a naive `model_dump()` keeps every unset field and overstates the real payload by
 ~29%.
 

@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import time
+from typing import Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -21,6 +22,15 @@ from src.tool_groups import resolve_tool_names
 from src.tools.crawl_url import crawl_url as _crawl_url
 from src.tools.extract_requirements import extract_requirements as _extract_requirements
 from src.tools.heal_locator import heal_locator as _heal_locator
+from src.tools.script_inspection import (
+    inspect_script as _inspect_script,
+    validate_script_locators as _validate_script_locators,
+    check_script_for_credential_exposure as _check_script_for_credential_exposure,
+)
+from src.tools.scoped_execution import (
+    execute_script_only as _execute_script_only,
+    execute_script_step_by_step as _execute_script_step_by_step,
+)
 
 server = Server("testbots-mcp-server")
 
@@ -582,7 +592,7 @@ TOOLS = [
     # Version Control — branches, commits, and Pull Requests over test scripts.
     Tool(name="list_branches", description="List version-control branches in the project, optionally filtered by name.", inputSchema={"type": "object", "properties": {"query": {"type": "string", "description": "Optional name filter"}}}),
     Tool(name="get_scripts_for_branch", description="List the test scripts that are members of a branch. This is the ONLY correct way to answer 'which scripts are on branch X' — TestScript.currentBranchName does NOT reflect real branch membership.", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}}, "required": ["branch_name"]}),
-    Tool(name="delete_branch", description="Delete a version-control branch. Scripts that were on it are moved back to main and a project state pointing at it is reset to main, so the work survives — but the branch's own history does not. Refused with 400 for the default branch and for protected branches. Confirm with the user before calling.", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}}, "required": ["branch_name"]}),
+    Tool(name="delete_branch", description="Delete a version-control branch. Scripts that were on it are moved back to main and a project state pointing at it is reset to main, so the work survives — but the branch's own history does not. Refused with 400 for the default branch and for protected branches. REQUIRES CONFIRMATION: pass confirmed=true only after explicitly asking the user to confirm the deletion.", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}, "confirmed": {"type": "boolean", "default": False, "description": "Confirmation gate — pass true only after confirming with the user"}}, "required": ["branch_name"]}),
     Tool(name="create_branch", description="Create a branch (fork from from_branch, default main). TWO-PHASE: the server runs a preflight conflict check and may return status NEEDS_CONFIRMATION with details instead of creating — relay that to the user and only resend with confirmed=true after they agree. strategy: FROM_BRANCH (default, fork from from_branch HEAD) or FROM_CURRENT (include scripts' individual branch work).", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}, "from_branch": {"type": "string", "default": "main"}, "strategy": {"type": "string", "enum": ["FROM_BRANCH", "FROM_CURRENT"]}, "confirmed": {"type": "boolean", "default": False, "description": "Set true ONLY to confirm a NEEDS_CONFIRMATION response"}, "script_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional — branch only these scripts (default: all)"}, "is_protected": {"type": "boolean", "default": False, "description": "Require an approved PR to merge into this branch; also blocks deletion"}}, "required": ["branch_name"]}),
     Tool(name="commit_branch", description="Commit all current work on a branch with a message (and optional tag like 'v2.0').", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}, "message": {"type": "string"}, "tag": {"type": "string"}}, "required": ["branch_name", "message"]}),
     Tool(name="list_commits", description="List commit history for a branch (paged).", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string"}, "page": {"type": "integer", "default": 0}, "size": {"type": "integer", "default": 20}}, "required": ["branch_name"]}),
@@ -608,7 +618,7 @@ TOOLS = [
     # One generic tool set instead of 10 per-entity ones; entity_type picks the route.
     Tool(name="list_archived_assets", description="List soft-deleted (archived) assets of one type — what the UI shows under Administration → Archive. Deleting an asset in any module archives it rather than destroying it.", inputSchema={"type": "object", "properties": {"entity_type": {"type": "string", "enum": ["epic", "story", "website", "page", "locator", "test_script", "test_suite", "test_bot", "test_bot_folder", "recorded_script"]}, "search": {"type": "string", "description": "Optional name filter"}, "page": {"type": "integer", "default": 0}, "size": {"type": "integer", "default": 50}}, "required": ["entity_type"]}),
     Tool(name="restore_asset", description="Restore an archived asset back to its module (un-delete). Find the asset_id via list_archived_assets first.", inputSchema={"type": "object", "properties": {"entity_type": {"type": "string", "enum": ["epic", "story", "website", "page", "locator", "test_script", "test_suite", "test_bot", "test_bot_folder", "recorded_script"]}, "asset_id": {"type": "string"}}, "required": ["entity_type", "asset_id"]}),
-    Tool(name="permanently_delete_asset", description="PERMANENTLY delete an archived asset — irreversible, the 'Delete forever' action in the Archive Manager. Only works on assets that are already archived. Confirm with the user before calling this unless they explicitly asked for permanent deletion.", inputSchema={"type": "object", "properties": {"entity_type": {"type": "string", "enum": ["epic", "story", "website", "page", "locator", "test_script", "test_suite", "test_bot", "test_bot_folder", "recorded_script"]}, "asset_id": {"type": "string"}}, "required": ["entity_type", "asset_id"]}),
+    Tool(name="permanently_delete_asset", description="PERMANENTLY delete an archived asset — irreversible, the 'Delete forever' action in the Archive Manager. Only works on assets that are already archived. REQUIRES CONFIRMATION: pass confirmed=true only after explicitly asking the user and getting their approval for the irreversible deletion.", inputSchema={"type": "object", "properties": {"entity_type": {"type": "string", "enum": ["epic", "story", "website", "page", "locator", "test_script", "test_suite", "test_bot", "test_bot_folder", "recorded_script"]}, "asset_id": {"type": "string"}, "asset_name": {"type": "string", "description": "Human-readable name (for error messages)"}, "confirmed": {"type": "boolean", "default": False, "description": "Confirmation gate — pass true only after confirming with the user"}}, "required": ["entity_type", "asset_id"]}),
 
     # Tunnel (Administration → Tunnel) — secure bridge exposing a private/local app to the cloud
     # execution grid. Only these 4 operations exist server-side.
@@ -647,6 +657,13 @@ TOOLS = [
     Tool(name="get_grid_capabilities", description="One call returns everything an execute_bot config needs for a grid: valid platforms (osType values), browsers, resolutions, and browser versions (pass browser to get its versions). Use this instead of guessing — values differ per grid ('Grid OS'/'latest' on plain Selenium, real OS/version lists on TestingBot/BrowserStack).", inputSchema={"type": "object", "properties": {"grid_id": {"type": "string"}, "testing_type": {"type": "string", "default": "Web"}, "browser": {"type": "string", "description": "Optional — include to also get this browser's valid versions"}}, "required": ["grid_id"]}),
     Tool(name="execute_bot", description="Run a TestBot — on the cloud grid pool, or on this machine's own local agent if gridId resolves to it (detected automatically; routed directly to localhost:9202, bypassing the cloud, since the cloud has no way to deliver a job to a specific developer's machine). execution_configuration is validated locally before submission. REQUIRED: baseUrl (an ENVIRONMENT ID from list_environments/create_environment — NOT a URL, despite the name; the backend resolves it via environment lookup and a raw URL kills the run at report time), browser + browserVersion + osType (from get_grid_capabilities), gridId (from list_grids). Returns the background JOB id. Poll get_job_status(jobId) with widening gaps (~30s, 60s, 120s), then pass that SAME id to get_execution_report — it resolves a job id to its execution, so no matching on names or timestamps. SUCCEEDED means the job ran, NOT that the tests passed; only the report says that. TO RUN A SCRIPT THAT LIVES ON A BRANCH, set execution_configuration.targetBranchName to that branch — this is the run-time branch selector (the same one the UI's run dialog offers). NEVER propose merging a branch into main just to run or verify a script; a merge is only for making a version permanent, and suggesting one as a prerequisite to testing sends the user through a PR they did not need.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "execution_configuration": {"type": "object", "description": "Required: baseUrl (Environment ID), browser, browserVersion, osType, gridId. Optional: resolution, type ('Web'), timeout (1-300, default 60), waitForElementTimeout (1-300, default 30), delayBetweenSteps (0-30), numberOfRetries (0-3), screenshot flags, targetBranchName, profileId.", "properties": {"baseUrl": {"type": "string", "description": "Environment ID (NOT a URL)"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string", "description": "From list_grids, fetched THIS session — a grid id remembered from an earlier conversation may have been deleted since, and the run fails minutes in with a null gridUrlForExecution."}, "resolution": {"type": "string"}, "timeout": {"type": "integer"}, "takeScreenshots": {"type": "boolean"}, "screenshotOnError": {"type": "boolean", "description": "Capture on a failed step (default true) — this is your failure evidence."}, "screenshotAfterEachStep": {"type": "boolean", "description": "Every step, not just failures."}, "screenshotOnFinish": {"type": "boolean", "description": "Final state (default true)."}, "targetBranchName": {"type": "string", "description": "Which branch's committed version to run. This is how you test a script on a branch — no merge required. Confirm it with get_scripts_for_branch when a recent edit is supposed to be included; execute_bot runs the last COMMITTED version, so an uncommitted edit will not appear."}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}, "name": {"type": "string", "description": "Execution display name (defaults to the bot's name)"}, "profile_id": {"type": "string"}, "partial_execution": {"type": "boolean", "default": False}}, "required": ["bot_id", "execution_configuration"]}),
     Tool(name="get_execution_status", description="Progress/status poll for a running execution (by executionId from execute_bot). The lightweight endpoint reports UNKNOWN for finished runs — this tool automatically falls back to the detailed report's overall status in that case. For queue-position detail, use get_job_status with the jobId from execute_bot's response.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
+
+    # Script inspection & scoped execution (improvements from retrospective)
+    Tool(name="inspect_script", description="Pre-execution inspection: step count, locator coverage, vault secret usage, branch info. Call this BEFORE executing a script to catch issues early rather than discovering them at runtime. Shows which steps reference vault secrets (resolved at runtime, appear in reports) and which use UI locators that may be stale.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}}, "required": ["script_id"]}),
+    Tool(name="validate_script_locators", description="Check all UI locators in a script — which ones exist, which may be flagged as broken. Returns the locator status and recommends scan_broken_locators/heal_locator before executing if any issues are found.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}}, "required": ["script_id"]}),
+    Tool(name="check_script_for_credential_exposure", description="Scan a script for plaintext credentials accidentally baked into step values. DETECTION ONLY — it tells you what's there, not a filter. Reports email addresses, passwords, tokens, API keys that may be exposed. Recommends vault secrets (type 7) as the fix: create_config_vault_secret + reference it instead of the literal value.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}}, "required": ["script_id"]}),
+    Tool(name="execute_script_only", description="Run a SINGLE test script in isolation, WITHOUT creating a full suite/bot structure. The fast path for targeting a specific script when debugging — avoids 40-90min full regression cycles. Internally creates temporary suite+bot, runs the script, and returns cleanup instructions. REQUIRED: execution_configuration (same as execute_bot: baseUrl/browser/browserVersion/osType/gridId). confirm_script_id is a safety parameter — must equal script_id to proceed (prevents accidental wrong-script execution).", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "execution_configuration": {"type": "object", "description": "Browser/grid/environment config (same shape as execute_bot)", "properties": {"baseUrl": {"type": "string"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string"}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}, "confirm_script_id": {"type": "string", "description": "Must equal script_id — safety check to prevent accidental wrong-script execution"}}, "required": ["script_id", "execution_configuration", "confirm_script_id"]}),
+
     Tool(name="schedule_bot_recurring", description="Create a recurring schedule for a TestBot — the real scheduler backing both the Scheduler Admin page and each TestBot's own clock-icon dialog (test-management-services). REQUIRED: name (1-120 chars, the schedule's own name — ask the user if not given), cron (a real cron expression — use convert_text_to_cron first if the user described it in plain language, e.g. 'every day at 9am'), execution_configuration (same shape as execute_bot's: baseUrl/browser/browserVersion/osType/gridId required). emails (result-recipient list) is optional but should be asked for — check list_scheduler_recipient_emails for previously-used addresses first.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "name": {"type": "string", "description": "The schedule's own name, 1-120 chars"}, "emails": {"type": "array", "items": {"type": "string"}, "description": "Result-notification recipients"}, "cron": {"type": "string", "description": "Cron expression, e.g. '0 9 * * *'. Use convert_text_to_cron to derive one from plain language."}, "execution_configuration": {"type": "object", "properties": {"baseUrl": {"type": "string", "description": "Environment ID (NOT a URL)"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string"}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}}, "required": ["bot_id", "name", "cron", "execution_configuration"]}),
     Tool(name="cancel_schedule", description="Delete a recurring schedule created by schedule_bot_recurring (test-management-services' real scheduler).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}}, "required": ["schedule_id"]}),
     Tool(name="update_schedule", description="Update an existing recurring schedule (name, emails, cron, and/or execution_configuration) — only supply the fields you want changed, everything else is preserved from the current schedule (fetched first, merged, then saved as a whole — the real endpoint has no partial-patch mode).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}, "bot_id": {"type": "string"}, "name": {"type": "string"}, "emails": {"type": "array", "items": {"type": "string"}}, "cron": {"type": "string"}, "execution_configuration": {"type": "object"}}, "required": ["schedule_id"]}),
@@ -997,6 +1014,28 @@ async def _execution_id_for_job(clients: ClientBundle, job_id: str) -> str | Non
     return None
 
 
+def _require_deletion_confirmation(entity_type: str, entity_id: str, entity_name: str, confirmed: bool) -> Optional[dict]:
+    """
+    Confirmation gate for destructive operations. Prevents accidental deletions of shared/permanent assets.
+
+    Returns an error dict if confirmation is missing/wrong; None if confirmed.
+    """
+    if not confirmed:
+        return {
+            "status": "NEEDS_CONFIRMATION",
+            "error": f"Deleting {entity_type} '{entity_name}' ({entity_id}) is permanent and cannot be undone.",
+            "instructions": (
+                f"This deletion affects everyone with access to this project. Pass confirmed=true "
+                f"to proceed with deletion. Resend the same request with confirmed=true only after "
+                f"confirming with the user that they actually want to delete this."
+            ),
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "entity_name": entity_name,
+        }
+    return None
+
+
 async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: bool = False):
     if is_hosted and name in _HOSTED_UNSUPPORTED:
         return {"error": f"{name} is not available over the hosted MCP server yet — run testbots-mcp-server locally via stdio for this tool."}
@@ -1220,6 +1259,12 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "get_scripts_for_branch":
         return await clients.test_mgmt.get_scripts_for_branch(args["branch_name"])
     if name == "delete_branch":
+        # Confirmation gate: deleting a branch is permanent and affects all scripts on it
+        confirmation_error = _require_deletion_confirmation(
+            "branch", args["branch_name"], args["branch_name"], args.get("confirmed", False)
+        )
+        if confirmation_error:
+            return confirmation_error
         return await clients.test_mgmt.delete_branch(args["branch_name"])
     if name == "create_branch":
         return await clients.test_mgmt.create_branch(
@@ -1289,6 +1334,12 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             return await clients.test_mgmt.restore_recorded_script(args["asset_id"])
         return await clients.user.restore_archived(args["entity_type"], args["asset_id"])
     if name == "permanently_delete_asset":
+        # Confirmation gate: permanent deletion is irreversible
+        confirmation_error = _require_deletion_confirmation(
+            args["entity_type"], args["asset_id"], args.get("asset_name", args["asset_id"]), args.get("confirmed", False)
+        )
+        if confirmation_error:
+            return confirmation_error
         if args["entity_type"] == "recorded_script":
             return await clients.test_mgmt.permanently_delete_recorded_script(args["asset_id"])
         return await clients.user.permanently_delete_archived(args["entity_type"], args["asset_id"])
@@ -1429,6 +1480,17 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             except Exception:
                 pass  # keep the lightweight answer — a poll must not fail because the report isn't ready
         return status
+
+    # Script inspection & scoped execution (from retrospective improvements)
+    if name == "inspect_script":
+        return await _inspect_script(clients, args["script_id"])
+    if name == "validate_script_locators":
+        return await _validate_script_locators(clients, args["script_id"])
+    if name == "check_script_for_credential_exposure":
+        return await _check_script_for_credential_exposure(clients, args["script_id"])
+    if name == "execute_script_only":
+        return await _execute_script_only(clients, args["script_id"], args["execution_configuration"], args.get("confirm_script_id"))
+
     if name == "schedule_bot_recurring":
         # Real scheduler (test-management-services' /rest/api/schedulers) — NOT
         # background-v2-services' schedule-recurring endpoint this tool used before, which

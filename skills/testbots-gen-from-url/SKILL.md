@@ -2,7 +2,9 @@
 name: testbots-gen-from-url
 description: Explore a live web app and write test scripts for the flows it finds
 tools:
+  - mcp__testbots-mcp-server__get_context
   - mcp__testbots-mcp-server__crawl_url
+  - mcp__testbots-mcp-server__get_page_by_url
   - mcp__testbots-mcp-server__create_website
   - mcp__testbots-mcp-server__create_page
   - mcp__testbots-mcp-server__add_locators
@@ -12,6 +14,8 @@ tools:
   - mcp__testbots-mcp-server__create_epic
   - mcp__testbots-mcp-server__list_stories
   - mcp__testbots-mcp-server__create_story
+  - mcp__testbots-mcp-server__list_branches
+  - mcp__testbots-mcp-server__create_branch
   - mcp__testbots-mcp-server__create_test_script
 ---
 
@@ -68,9 +72,10 @@ The user has a deployed web application and wants test scripts generated automat
 
 8. For each flow, call `create_test_script` with:
    - Name format: "<PageName> — <FlowType>" (e.g. "Login Page — Happy Path")
-   - Steps built from the locators captured and the resolved templateIds — see CLAUDE.md's
-     "TestStep shape" section for the exact, proven-working `parameters` shape. In short: each
-     step needs `templateId` + `templateTitle` (built-ins only) + a `parameters` array (NOT
+   - Steps built from the locators captured and the resolved templateIds, in the exact shape
+     below — it is the proven-working one, and the near-miss variants fail in ways that look
+     like success. Each step needs `templateId` + `templateTitle` (built-ins only) + a
+     `parameters` array (NOT
      `params`) with one entry per `{{placeholder}}` in `templateTitle` — `{"key": "ui-locator",
      "value": {"locatorId": "<real id from add_locators>"}, "paramClass":
      "ai.automationhq.commons.entities.assets.UILocator"}` for element targets (never fabricate
@@ -115,8 +120,8 @@ The user has a deployed web application and wants test scripts generated automat
   {{number}} seconds", preferred when a locator on the destination page is already known — it
   resolves as soon as the page is ready) or `template-id-35` ("Wait for {{number}} seconds", plain
   fixed delay, ~5-10s, use when no destination-page locator is known yet). Skipping this causes the
-  verify step to run against the pre-navigation page and fail — confirmed live, see CLAUDE.md's
-  "Post-navigation race" section.
+  verify step to run against the pre-navigation page and fail: the URL/element check is a single
+  immediate read with no retry loop, so it sees the page the click was meant to leave.
 - Never create a script with 0 steps
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
 - **Agree the granularity before generating at scale.** One script per test case and one script

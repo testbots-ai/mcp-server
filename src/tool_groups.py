@@ -1,9 +1,9 @@
 """
-Tool profiles: per-connection subsets of the 136-tool surface.
+Tool profiles: per-connection subsets of the 138-tool surface.
 
 Every tool schema is serialized into the model's context on every request, before it reads the
-user's first word — MCP has no lazy schema loading. Two costs follow. The obvious one is ~14.5k
-tokens of fixed overhead per turn. The one that actually bites is selection accuracy: at 136
+user's first word — MCP has no lazy schema loading. Two costs follow. The obvious one is ~16.4k
+tokens of fixed overhead per turn. The one that actually bites is selection accuracy: at 138
 options a model starts pattern-matching on names, and picking `list_performance_bots` where
 `list_bots` was meant returns an empty list rather than an error, so the answer is confidently
 wrong instead of visibly broken.
@@ -11,7 +11,7 @@ wrong instead of visibly broken.
 A client that only needs the everyday loop can ask for `core` and stop paying for both.
 
 Membership is kept here as a name -> group mapping rather than as a field on each Tool. Adding a
-field would mean touching all 136 definitions in mcp_server.py and would conflict with every
+field would mean touching all 138 definitions in mcp_server.py and would conflict with every
 branch in flight; a separate table is a one-line edit per tool and the partition test below is
 what keeps it honest.
 """
@@ -239,9 +239,15 @@ _CORE_EXTRA = (
     "execute_bot",
     "get_execution_status",
     "get_job_status",
-    # The one versioning tool the run path can't do without: execute_bot runs a branch's last
-    # COMMITTED version, so "did my edit actually make it into this run" is unanswerable without
-    # it. A field report traced a wasted execution cycle to exactly that blind spot.
+    # versioning — the branch-aware authoring loop only, not the PR surface. Both generation
+    # skills tell the model to offer the real branches before creating a script, because `main`
+    # is protected: an edit there stays an uncommitted version and execute_bot silently keeps
+    # running the previous one. Without these the rule is advice the model cannot act on — it
+    # needs list_branches/create_branch to offer a real choice, commit_branch to make the chosen
+    # branch runnable at all, and get_scripts_for_branch to answer "did my edit reach this run".
+    "list_branches",
+    "create_branch",
+    "commit_branch",
     "get_scripts_for_branch",
 )
 

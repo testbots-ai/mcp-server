@@ -57,6 +57,23 @@ def _skill_tools() -> dict[str, set[str]]:
     return out
 
 
+def _skill_body_tools() -> dict[str, set[str]]:
+    """Tool names each SKILL.md's PROSE names, whether or not the frontmatter declares them.
+
+    The frontmatter is a hand-maintained list and drifts from what the body actually instructs;
+    that drift is how a workflow ends up depending on a tool nobody checked. Anything the body
+    names in backticks that is also a real tool counts, because a body that discusses a tool the
+    client cannot see leaves the model stuck at exactly that sentence — a mention is a dependency
+    whether or not the author remembered to declare it.
+    """
+    out: dict[str, set[str]] = {}
+    for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
+        text = skill_md.read_text(encoding="utf-8")
+        body = text.split("---", 2)[2] if text.startswith("---") else text
+        out[skill_md.parent.name] = set(re.findall(r"`(\w+)`", body)) & ALL_TOOL_NAMES
+    return out
+
+
 def test_every_skill_works_under_the_core_profile():
     """`core` is DEFINED as "keeps the bundled skills working" — this is that definition.
 
@@ -71,6 +88,22 @@ def test_every_skill_works_under_the_core_profile():
 
     missing = {name: sorted(tools - core) for name, tools in skills.items() if tools - core}
     assert not missing, f"skills referencing tools hidden by `core`: {missing}"
+
+
+def test_core_covers_every_tool_the_skill_bodies_name():
+    """The frontmatter is the declared contract; the body is what the model actually reads.
+
+    Checking only the declaration let `list_branches` and `commit_branch` sit outside `core`
+    while the test stayed green — both generation skills instruct the model to offer the real
+    branches before creating a script, so under `?profile=core` it was told to do something it
+    had no tool for, and fell back to the protected `main` the rule exists to avoid.
+    """
+    core = PROFILES["core"]
+    bodies = _skill_body_tools()
+    assert bodies, "no skill bodies parsed — the file format changed"
+
+    missing = {name: sorted(tools - core) for name, tools in bodies.items() if tools - core}
+    assert not missing, f"skill prose names tools hidden by `core`: {missing}"
 
 
 def test_skill_frontmatter_references_real_tools():
