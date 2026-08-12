@@ -138,7 +138,7 @@ async def test_recorded_script_archive_routes_to_test_mgmt_client_not_user_clien
     try:
         await _dispatch("list_archived_assets", {"entity_type": "recorded_script"}, DEFAULT_BUNDLE, is_hosted=False)
         await _dispatch("restore_asset", {"entity_type": "recorded_script", "asset_id": "r1"}, DEFAULT_BUNDLE, is_hosted=False)
-        await _dispatch("permanently_delete_asset", {"entity_type": "recorded_script", "asset_id": "r1"}, DEFAULT_BUNDLE, is_hosted=False)
+        await _dispatch("permanently_delete_asset", {"entity_type": "recorded_script", "asset_id": "r1", "confirmed": True}, DEFAULT_BUNDLE, is_hosted=False)
     finally:
         (DEFAULT_BUNDLE.user.list_archived,
          DEFAULT_BUNDLE.user.restore_archived,

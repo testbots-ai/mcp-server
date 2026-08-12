@@ -64,6 +64,9 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "create_common_function",
         "update_common_function",
         "extract_requirements",
+        "inspect_script",
+        "validate_script_locators",
+        "check_script_for_credential_exposure",
     ),
     "planning": (
         "list_epics",
@@ -86,6 +89,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "create_environment",
         "get_grid_capabilities",
         "execute_bot",
+        "execute_script_only",
         "get_execution_status",
         "get_job_status",
         "check_local_agent_status",
