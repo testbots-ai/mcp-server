@@ -41,6 +41,18 @@ class DualAuthMiddleware:
         if auth.lower().startswith("bearer "):
             access = await self.verifier.verify_token(auth[7:])
             if access is None or (access.expires_at and access.expires_at < time.time()):
+                # Not one of our OAuth blobs — but it may be a first-party caller presenting the
+                # signed-in user's own AHQ platform JWT (see AhqCredentials.from_headers). Those
+                # arrive with org-id + projectId, which an OAuth client never sends because its
+                # credentials are sealed inside the token instead. Fall through to the header
+                # path rather than 401ing, or that path is unreachable behind this middleware.
+                #
+                # Safe for the same reason the X-API-AUTH-KEY path below is: nothing here trusts
+                # the credential. It is replayed to the AHQ gateway on every downstream call, and
+                # the gateway validates it there — a forged token buys a 401 from AHQ, not data.
+                if headers.get("org-id") and headers.get("projectid"):
+                    await self.app(scope, receive, send)
+                    return
                 await self._send_auth_error(send, "invalid_token", "Token is invalid or expired")
                 return
             scope["ahq_credentials"] = AhqCredentials(

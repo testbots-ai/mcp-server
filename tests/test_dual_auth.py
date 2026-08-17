@@ -120,3 +120,34 @@ async def test_options_preflight_passes_through_unauthenticated():
     mw, _ = _middleware(rec.app)
     await mw(_scope([], method="OPTIONS"), rec.receive, rec.send)
     assert rec.reached_app
+
+
+async def test_user_platform_jwt_falls_through_to_the_header_path():
+    # A first-party caller (the AI Test Builder) presents the signed-in user's own AHQ JWT, which
+    # is NOT one of our OAuth blobs. Without the fall-through it 401s here and never reaches
+    # AhqCredentials.from_headers, making the whole bearer header path unreachable.
+    rec = _Recorder()
+    mw, _ = _middleware(rec.app)
+    await mw(
+        _scope([
+            (b"authorization", b"Bearer some.platform.jwt"),
+            (b"org-id", b"org-1"),
+            (b"projectid", b"proj-1"),
+        ]),
+        rec.receive,
+        rec.send,
+    )
+    assert rec.reached_app
+    # No sealed credentials: _resolve_clients builds them from the headers instead.
+    assert "ahq_credentials" not in rec.seen_scope
+
+
+async def test_unverifiable_bearer_without_org_and_project_still_401s():
+    # The fall-through is scoped to requests that actually look like the header path. A bad OAuth
+    # token on its own must keep returning invalid_token, or clients lose the signal that tells
+    # them to re-run the OAuth flow.
+    rec = _Recorder()
+    mw, _ = _middleware(rec.app)
+    await mw(_scope([(b"authorization", b"Bearer garbage")]), rec.receive, rec.send)
+    assert not rec.reached_app
+    assert rec.messages[0]["status"] == 401

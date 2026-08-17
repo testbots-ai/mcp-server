@@ -117,6 +117,15 @@ Key facts a future session must not rediscover:
   user's token: one configured key pins a whole multi-tenant deployment to the org that minted it,
   and it carries no user, so everything is audited to the support user. First caller: the AI Test
   Builder in `ahq-test-management-services`.
+  **`DualAuthMiddleware` has to cooperate or this path is dead code** (found live in 5.4.0, fixed
+  in 5.4.1): it verifies ANY `Authorization: Bearer` as one of our OAuth blobs and 401s on
+  failure, so a platform JWT never reached `from_headers` at all. It now falls through to the
+  header path when verification fails AND the request carries `org-id` + `projectId` — headers an
+  OAuth client never sends, since its credentials are sealed inside the token. A bad OAuth token
+  on its own still 401s, so clients keep the signal that tells them to re-run the OAuth flow.
+  Trusting the unverified JWT here is the same posture as the `X-API-AUTH-KEY` path: nothing is
+  trusted locally, the credential is replayed to the AHQ gateway on every downstream call, and a
+  forged one buys a 401 from AHQ rather than data.
 - **The connection can never outlive the AHQ token sealed inside it.** `_capped_ttl` binds BOTH
   the access and the refresh token to the embedded AHQ token's `exp`, necessarily — every
   downstream call re-presents that token to the gateway, so an expired one is useless whatever we
