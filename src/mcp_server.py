@@ -885,9 +885,10 @@ def _resolve_clients() -> tuple[ClientBundle, bool]:
         if not creds.project_id:
             raise RuntimeError(
                 "testbots-mcp-server is not configured for this request: the 'projectId' header is "
-                "missing. Header auth requires BOTH 'X-API-AUTH-KEY' and 'projectId'. If your "
-                "client can only send one header, connect via OAuth instead — its consent page "
-                "picks the project for you (see CONNECT.md)."
+                "missing. Header auth requires 'projectId' alongside either 'X-API-AUTH-KEY' or a "
+                "user's 'Authorization: Bearer' JWT (with 'org-id'). If your client can only send "
+                "one header, connect via OAuth instead — its consent page picks the project for "
+                "you (see CONNECT.md)."
             )
     return ClientBundle.build(credentials=creds, http_client=app_http_client.client), True
 

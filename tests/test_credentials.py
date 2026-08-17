@@ -148,3 +148,48 @@ def test_from_headers_falls_back_to_default_when_token_has_no_urldetails():
     creds = AhqCredentials.from_headers(headers, base_url="https://api-dev.automationhq.ai")
 
     assert creds.base_url == "https://api-dev.automationhq.ai"
+
+
+def test_from_headers_accepts_a_user_bearer_jwt():
+    # A first-party caller forwards the signed-in user's own platform JWT instead of a service
+    # api-key, so the gateway attaches that user and their roles rather than blanket org-wide
+    # access. org_id comes from the header here because the gateway's JWT carries no
+    # organizationId claim to read.
+    token = _fake_jwt(sub="user-1")
+    headers = {"Authorization": f"Bearer {token}", "org-id": "org-from-header", "projectId": "p-1"}
+
+    creds = AhqCredentials.from_headers(headers, base_url="https://api-dev.automationhq.ai")
+
+    assert creds.auth_scheme == "bearer"
+    assert creds.api_token == token  # the "Bearer " prefix is stripped; the client re-adds it
+    assert creds.org_id == "org-from-header"
+    assert creds.project_id == "p-1"
+
+
+def test_from_headers_bearer_without_prefix_is_accepted():
+    # AHQ's own frontend sends the raw token with no "Bearer " prefix, and services forward the
+    # header verbatim, so both shapes reach us.
+    token = _fake_jwt(sub="user-1")
+    headers = {"Authorization": token, "org-id": "org-1", "projectId": "p-1"}
+
+    creds = AhqCredentials.from_headers(headers, base_url="https://api-dev.automationhq.ai")
+
+    assert creds.api_token == token
+    assert creds.auth_scheme == "bearer"
+
+
+def test_api_key_still_wins_when_both_headers_are_present():
+    # Existing header clients must be unaffected by the bearer path being added.
+    api_key = _fake_jwt(organizationId="org-from-token")
+    headers = {
+        "X-API-AUTH-KEY": api_key,
+        "Authorization": f"Bearer {_fake_jwt(sub='someone-else')}",
+        "org-id": "ignored",
+        "projectId": "p-1",
+    }
+
+    creds = AhqCredentials.from_headers(headers, base_url="https://api-dev.automationhq.ai")
+
+    assert creds.auth_scheme == "api-key"
+    assert creds.api_token == api_key
+    assert creds.org_id == "org-from-token"

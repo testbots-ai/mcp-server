@@ -112,6 +112,32 @@ class AhqCredentials:
         # via the token's own urlDetails.baseUrl claim (base_url_from_claims), which is checked
         # against an explicit allowlist, not trusted verbatim.
         token = headers.get("X-API-AUTH-KEY", "")
+
+        # A first-party caller that already holds the signed-in user's platform JWT (the AI Test
+        # Builder in ahq-test-management-services is the first) forwards it rather than swapping
+        # in a service credential. That matters twice over: an ORGANIZATION api-key is scoped to
+        # whichever org minted it, so one configured key pins an entire multi-tenant deployment
+        # to a single organization; and it carries no user, so the gateway attaches no roles and
+        # every action is audited to the support user.
+        #
+        # org_id comes from the HEADER on this path, unlike the api-key path below. The gateway's
+        # own JWT issuance embeds only sub/userId/username/roles — there is no organizationId
+        # claim to read — so the header is the only signal available. It is no weaker than it
+        # looks: the gateway has already validated the JWT's signature by the time the request
+        # reaches us, and every downstream AHQ service authorizes the org against that user.
+        if not token:
+            authorization = headers.get("Authorization", "")
+            if authorization:
+                bearer = authorization[7:] if authorization[:7].lower() == "bearer " else authorization
+                claims = decode_ahq_token(bearer)
+                return cls(
+                    base_url=base_url_from_claims(claims, allowed_extra_base_urls) or base_url,
+                    api_token=bearer,
+                    org_id=headers.get("org-id", ""),
+                    project_id=headers.get("projectId", ""),
+                    auth_scheme="bearer",
+                )
+
         org_id = ""
         resolved_base_url = base_url
         if token:

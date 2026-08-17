@@ -106,6 +106,17 @@ Key facts a future session must not rediscover:
   credentials into `scope["ahq_credentials"]`; legacy `X-API-AUTH-KEY`+`projectId` headers →
   pass-through to the original `from_headers` path. The SDK's `RequireAuthMiddleware` is NOT
   used (it would 401 the header clients).
+- **`from_headers` also accepts a user's platform JWT (v5.4.0)**: `Authorization` (with or
+  without the `Bearer ` prefix) + `org-id` + `projectId`, resolving to `auth_scheme="bearer"`.
+  `X-API-AUTH-KEY` still wins when both are present, so existing header clients are untouched.
+  **org_id comes from the HEADER on this path only** — the gateway's own JWT issuance embeds just
+  `sub`/`userId`/`username`/`roles`, so unlike the api-key path there is no `organizationId` claim
+  to read; the gateway has already verified the signature by the time the request arrives, and
+  every downstream service authorizes the org against that user anyway. This exists because an
+  ORGANIZATION api-key forces two compromises on a first-party caller that already holds the
+  user's token: one configured key pins a whole multi-tenant deployment to the org that minted it,
+  and it carries no user, so everything is audited to the support user. First caller: the AI Test
+  Builder in `ahq-test-management-services`.
 - **The connection can never outlive the AHQ token sealed inside it.** `_capped_ttl` binds BOTH
   the access and the refresh token to the embedded AHQ token's `exp`, necessarily — every
   downstream call re-presents that token to the gateway, so an expired one is useless whatever we
