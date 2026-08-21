@@ -119,10 +119,12 @@ def test_base_url_from_claims_rejects_url_outside_allowlist():
 
 
 def test_base_url_from_claims_honors_extra_allowlist():
-    claims = {"urlDetails": _url_details("https://api-staging.automationhq.ai")}
+    # A self-hosted gateway, deliberately not one of PROFILE_BASE_URLS - the point of the extra
+    # allowlist is hosts this build has never heard of.
+    claims = {"urlDetails": _url_details("https://ahq.example-partner.com")}
     assert base_url_from_claims(claims) is None
-    assert base_url_from_claims(claims, frozenset({"https://api-staging.automationhq.ai"})) == (
-        "https://api-staging.automationhq.ai"
+    assert base_url_from_claims(claims, frozenset({"https://ahq.example-partner.com"})) == (
+        "https://ahq.example-partner.com"
     )
 
 

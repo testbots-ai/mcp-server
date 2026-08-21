@@ -125,7 +125,7 @@ def test_env_prod_signs_in_to_prods_gateway_not_the_configured_one(monkeypatch):
 def test_an_unknown_profile_is_refused_rather_than_silently_using_the_default(monkeypatch, capsys):
     """Otherwise it signs in to whatever is configured and saves the result in a file named
     after an environment it never contacted."""
-    monkeypatch.setattr(login.sys, "argv", ["testbots-login", "--env=staging"])
+    monkeypatch.setattr(login.sys, "argv", ["testbots-login", "--env=qa"])
 
     assert login.main() == 1
     assert "no known gateway" in capsys.readouterr().out
