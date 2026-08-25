@@ -11,6 +11,7 @@ from typing import Mapping
 # password" rather than "wrong environment".
 PROFILE_BASE_URLS = {
     "dev": "https://api-dev.automationhq.ai",
+    "staging": "https://api-staging.automationhq.ai",
     "prod": "https://api.automationhq.ai",
 }
 
