@@ -34,8 +34,14 @@ _CANDIDATE_STRATEGIES_JS = """() => {
         if (el.getAttribute('name')) {
             candidates.push({ locateBy: 'css', locatorValue: `${el.tagName.toLowerCase()}[name="${el.getAttribute('name')}"]` });
         }
-        if (el.className) {
-            const cls = el.className.trim().split(/\\s+/).join('.');
+        if (el.getAttribute('placeholder')) {
+            candidates.push({ locateBy: 'css', locatorValue: `${el.tagName.toLowerCase()}[placeholder="${el.getAttribute('placeholder')}"]` });
+        }
+        if (typeof el.className === 'string' && el.className.trim()) {
+            // CSS.escape per class: an unescaped Tailwind arbitrary value like mt-[0.5px]
+            // makes the selector invalid rather than merely unmatched, so the candidate it
+            // produces can never heal anything.
+            const cls = el.className.trim().split(/\\s+/).filter(Boolean).map(function (c) { return CSS.escape(c); }).join('.');
             if (cls) candidates.push({ locateBy: 'css', locatorValue: `${el.tagName.toLowerCase()}.${cls}` });
         }
 

@@ -55,9 +55,20 @@ async def _extract_locators(page: Page) -> list[dict]:
                 css = `[data-testid="${el.getAttribute('data-testid')}"]`;
             } else if (el.getAttribute('aria-label')) {
                 css = `[aria-label="${el.getAttribute('aria-label')}"]`;
+            } else if (el.getAttribute('name')) {
+                css = el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
+            } else if (el.getAttribute('placeholder')) {
+                css = el.tagName.toLowerCase() + '[placeholder="' + el.getAttribute('placeholder') + '"]';
             } else {
-                css = el.tagName.toLowerCase() +
-                    (el.className ? '.' + el.className.trim().split(/\\s+/).join('.') : '');
+                // Every class goes through CSS.escape. A Tailwind arbitrary value such as
+                // mt-[0.5px] is not merely unmatched when left raw - the bracket opens an
+                // attribute selector, so the whole query throws InvalidSelectorException and
+                // the step fails with "The element locator is invalid". className is also an
+                // SVGAnimatedString on SVG elements, which has no trim().
+                const classes = (typeof el.className === 'string')
+                    ? el.className.trim().split(/\\s+/).filter(Boolean).map(function (c) { return CSS.escape(c); })
+                    : [];
+                css = el.tagName.toLowerCase() + (classes.length ? '.' + classes.join('.') : '');
             }
 
             elements.push({
