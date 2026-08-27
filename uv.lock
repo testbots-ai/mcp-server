@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "ahq-mcp-server"
-version = "5.6.0"
+version = "5.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

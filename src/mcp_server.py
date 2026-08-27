@@ -32,6 +32,7 @@ from src.tools.scoped_execution import (
     execute_script_step_by_step as _execute_script_step_by_step,
 )
 from src.tools.locator_usage import find_locator_usage as _find_locator_usage
+from src.tools import locator_validation as _locval
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -944,6 +945,24 @@ def _slim_response_obj(resp):
     return resp
 
 
+async def _resolve_locators_for_script(clients, script_id: str, steps) -> dict:
+    """
+    Resolve a script's own websiteId, then look its step locators up against it. A script that
+    cannot be read leaves the check unverified rather than failing the edit — the edit itself will
+    surface that error on its own terms a moment later, and a lookup must never become the failure.
+    """
+    website_id = None
+    try:
+        script = await clients.test_mgmt.get_test_script(script_id)
+        if isinstance(script, dict):
+            website_id = script.get("websiteId")
+    except Exception:
+        pass
+    resolution = await _locval.resolve_step_locators(clients, website_id, steps)
+    resolution["website_id"] = website_id
+    return resolution
+
+
 async def _dispatch_hosted(name: str, arguments: dict, clients: ClientBundle):
     """
     Hosted-only wrapper: per-org rate limiting plus one audit line per tool call. Tool
@@ -1162,10 +1181,17 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         )}
 
     if name == "add_test_steps":
-        return await clients.test_mgmt.add_test_steps(
+        # Resolve the element ids BEFORE writing. An id that resolves to nothing is refused; one
+        # that resolves is echoed back by name, which is the only way a valid-but-wrong locator
+        # becomes visible at the call site rather than at the next run.
+        resolution = await _resolve_locators_for_script(clients, args["script_id"], args["steps"])
+        if resolution["unresolved"]:
+            return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        result = await clients.test_mgmt.add_test_steps(
             args["script_id"], args["steps"], args.get("position"),
             branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"))
+        return _locval.annotate(result, resolution)
     if name == "delete_test_steps":
         return await clients.test_mgmt.delete_test_steps(
             args["script_id"],
@@ -1181,9 +1207,17 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "update_test_script":
         # branch_name is a sibling of `changes`, not one of the entity fields inside it — it
         # selects WHERE the edit lands rather than what the document says.
-        return await clients.test_mgmt.update_test_script(
+        changes = args["changes"]
+        resolution = {"resolved": [], "unresolved": [], "unverified": False, "website_id": None}
+        if isinstance(changes, dict) and changes.get("testSteps"):
+            resolution = await _resolve_locators_for_script(
+                clients, args["script_id"], changes["testSteps"])
+            if resolution["unresolved"]:
+                return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        result = await clients.test_mgmt.update_test_script(
             args["script_id"], branch_name=args.get("branch_name"),
-            expected_version=args.get("expected_version"), **args["changes"])
+            expected_version=args.get("expected_version"), **changes)
+        return _locval.annotate(result, resolution)
     if name == "create_test_script":
         # Schema `required` is advisory — not every MCP client enforces it — and this is the one
         # argument whose wrong value fails silently much later: a script created on protected
@@ -1212,9 +1246,17 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             kwargs["branch_name"] = args["branch_name"]
         if "repair_comment" in args:
             kwargs["repair_comment"] = args["repair_comment"]
-        return await clients.test_mgmt.create_test_script(
+        # website_id arrives directly here, so the locators can be resolved without reading the
+        # script first — it does not exist yet.
+        resolution = await _locval.resolve_step_locators(
+            clients, args.get("website_id"), args.get("steps"))
+        resolution["website_id"] = args.get("website_id")
+        if resolution["unresolved"]:
+            return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        result = await clients.test_mgmt.create_test_script(
             args["name"], args["steps"], args.get("page_id"), args.get("website_id"), args.get("story_id"), **kwargs
         )
+        return _locval.annotate(result, resolution)
 
     if name == "list_step_templates":
         return await clients.test_mgmt.list_templates(args.get("offset", 0))
