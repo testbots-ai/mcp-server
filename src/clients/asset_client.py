@@ -212,7 +212,26 @@ class AssetClient(BaseAhqClient):
         # {"items": [...], "status": 200, "count": N} — NOT {"content": [...]} like the other
         # paginated list_* endpoints in this client.
         result = await self.get("/rest/api/locators/broken")
-        return result if isinstance(result, list) else result.get("items", result)
+        items = result if isinstance(result, list) else result.get("items", result)
+        if isinstance(items, list) and not items:
+            # An empty list here is NOT "nothing is broken". Only the cloud path calls
+            # setBrokenLocatorReporter (ahq-background-v2-services' TestRemoteExecutionRepository);
+            # test-local-execution-services has zero occurrences, so a locator that fails during a
+            # local-agent run never sets broken=true and never reaches this endpoint. Returning a
+            # bare [] reads as an all-clear and sends the caller looking somewhere else entirely.
+            return {
+                "items": [],
+                "count": 0,
+                "note": (
+                    "No locator is FLAGGED broken — this is not the same as 'no locator is "
+                    "broken'. Only cloud executions report breakages; local-agent runs never "
+                    "set the flag, so if the failing run used the AHQ Local Agent this list is "
+                    "expected to be empty regardless of what actually broke. Diagnose from the "
+                    "execution report's per-step errors, or re-crawl the page with crawl_url / "
+                    "get_page_by_url and compare against the locator's stored strategies."
+                ),
+            }
+        return items
 
     async def get_page_by_locator_id(self, website_id: str, locator_id: str) -> dict:
         # Confirmed live: this endpoint 400s ("Required header 'websiteId' is not present") without

@@ -31,6 +31,8 @@ from src.tools.scoped_execution import (
     execute_script_only as _execute_script_only,
     execute_script_step_by_step as _execute_script_step_by_step,
 )
+from src.tools.locator_usage import find_locator_usage as _find_locator_usage
+from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
 
@@ -498,10 +500,13 @@ TOOLS = [
 
     # Test scripts
     Tool(name="list_test_scripts", description="List or search test scripts by name. Returns a summary per script (id, name, status, type, stepCount) — call get_test_script for a script's actual steps. The `name` filter is a plain case-insensitive substring match. Results cover the configured project only; use get_scripts_for_branch to ask which scripts are on a specific branch.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Optional case-insensitive substring filter"}}}),
-    Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}}, "required": ["script_id"]}),
+    Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. A 60+ step script can exceed the result token cap: summary=true gives one line per step, steps_from/steps_to (inclusive, 1-based) one range in full. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that. Its versionCount is what the editing tools' expected_version takes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "summary": {"type": "boolean", "description": "Step titles only"}, "steps_from": {"type": "integer"}, "steps_to": {"type": "integer"}}, "required": ["script_id"]}),
     Tool(name="delete_test_script", description="Delete a test script. This is the SAME soft delete the UI performs — the script is archived (isArchived=true), appears under Administration -> Archive, and can be brought back with restore_asset; it is not destroyed. TWO-PHASE: if the script is still referenced by any Test Set or TestBot, the first call deletes NOTHING and returns status NEEDS_CONFIRMATION listing them (the raw API signals this with a 202 that is easily misread as success). Relay that list to the user and only call again with confirmed=true if they agree — that detaches the script from each one as it deletes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "confirmed": {"type": "boolean", "default": False, "description": "Set true ONLY to confirm a prior NEEDS_CONFIRMATION response, after the user has agreed"}}, "required": ["script_id"]}),
-    Tool(name="add_test_steps", description="Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
-    Tool(name="update_test_script", description="Update fields of an existing test script (name, status, story_id, testSteps, ...) — GET-merge-PUT, so unspecified fields are preserved. Pass branch_name for the same reason as add_test_steps. Same protected-branch caveat.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "changes": {"type": "object", "description": "Fields to change, using the entity's own field names (e.g. name, status, storyId, testSteps)"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "changes", "branch_name"]}),
+    Tool(name="add_test_steps", description="Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
+    Tool(name="update_test_script", description="Update fields of an existing test script (name, status, story_id, testSteps, ...) — GET-merge-PUT, so unspecified fields are preserved. Pass branch_name for the same reason as add_test_steps. Same protected-branch caveat.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "changes": {"type": "object", "description": "Fields to change, using the entity's own field names (e.g. name, status, storyId, testSteps)"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "changes", "branch_name"]}),
+    Tool(name="delete_test_steps", description="Remove steps by 1-based sequence and/or testStepId, renumbering the rest. Use this rather than rebuilding the whole testSteps array via update_test_script — resending every unrelated step to drop one is how unrelated steps get corrupted. All-or-nothing: nothing is deleted unless every sequence/id matches. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequences": {"type": "array", "items": {"type": "integer"}}, "step_ids": {"type": "array", "items": {"type": "string"}}, "branch_name": {"type": "string"}, "expected_version": {"type": "integer"}}, "required": ["script_id"]}),
+    Tool(name="reorder_test_steps", description="Reorder steps. `order` is every step's CURRENT 1-based sequence in its new order, and must be a permutation of all of them — a partial list is refused, not guessed at.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "order": {"type": "array", "items": {"type": "integer"}}, "branch_name": {"type": "string"}, "expected_version": {"type": "integer"}}, "required": ["script_id", "order"]}),
+    Tool(name="find_locator_usage", description="Which scripts and Common Functions reference a locatorId — impact analysis before update_locator/apply_locator_fix. The same locatorId is routinely shared by a Common Function and a standalone script, so a fix in one place reads as complete while another caller still fails, and an edit to suit one script changes them all. Fetches every script, so use it per decision, not per edit.", inputSchema={"type": "object", "properties": {"locator_id": {"type": "string"}, "include_common_functions": {"type": "boolean", "default": True}}, "required": ["locator_id"]}),
     Tool(
         name="create_test_script",
         description=(
@@ -675,7 +680,7 @@ TOOLS = [
     Tool(name="list_recent_runs", description="List recent execution reports. With bot_id: that bot's execution history; without: the report list across bots. Start here to find the execution_id that get_execution_report needs.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "limit": {"type": "integer", "default": 10}}}),
 
     # Reporting
-    Tool(name="get_execution_report", description="Screenshots ride in this report as screenshotUrl per iteration — there is no separate screenshots call. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
+    Tool(name="get_execution_report", description="Screenshots ride in this report as screenshotUrl per iteration — there is no separate screenshots call. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}, "summary": {"type": "boolean", "description": "One row per script (status + first failing step). Use first on a multi-script run — the full report routinely exceeds the token cap"}, "failed_only": {"type": "boolean", "description": "Summary, failed scripts only"}}, "required": ["execution_id"]}),
     Tool(name="get_performance_report", description="Duration and ROI/time-saved metrics for an ordinary UI execution, by execution_id. Pass/fail detail is get_execution_report on the same id. Unrelated to get_performance_results, which polls a JMeter load test.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
 
     # Application context
@@ -893,17 +898,30 @@ def _resolve_clients() -> tuple[ClientBundle, bool]:
     return ClientBundle.build(credentials=creds, http_client=app_http_client.client), True
 
 
-_RESPONSE_OBJ_KEEP = ("id", "message", "details", "validationErrors")
+# The login-shaped fields of ResponseObj (ahq-data-commons ResponseObj.java) that carry nothing
+# on a mutation response. Everything NOT named here survives — see _slim_response_obj.
+_RESPONSE_OBJ_NOISE = frozenset({
+    "timestamp", "status", "firstName", "lastName", "userId", "email",
+    "organizationId", "partnerId", "projectId", "userRole", "firstTimeLogin",
+    "invited", "active", "ssoEnabled", "token", "story", "success",
+})
 
 
 def _slim_response_obj(resp):
     """
     AHQ mutation endpoints answer with a ~25-field ResponseObj/login-shaped envelope that is
     almost entirely nulls (firstName, ssoEnabled, token, story, ...) — pure token waste on every
-    write. Detect that envelope (message set, user fields empty) and strip it to the few real
-    fields. Also fix the untrustworthy success flag: ResponseObj.success defaults to false and
-    several handlers never set it, so a "Test script added successfully" arrives with
-    success:false — derive it from the message/status instead.
+    write. Detect that envelope (message set, user fields empty) and drop the dead half. Also
+    fix the untrustworthy success flag: ResponseObj.success defaults to false and several
+    handlers never set it, so a "Test script added successfully" arrives with success:false —
+    derive it from the message/status instead.
+
+    This subtracts the known-dead fields rather than keeping a fixed whitelist. A whitelist
+    silently ate every key a client method had ADDED to the envelope on the way out: execute_bot
+    attaches jobId and a next_step explaining that `id` is a job id and not an executionId, and
+    both were stripped here, leaving exactly {id, message, success} and a caller polling the
+    wrong id. Anything a client deliberately adds is by definition not envelope noise, so the
+    default has to be to keep it.
     """
     if (
         isinstance(resp, dict)
@@ -911,7 +929,10 @@ def _slim_response_obj(resp):
         and resp.get("message") is not None
         and resp.get("firstName") is None
     ):
-        slim = {k: resp[k] for k in _RESPONSE_OBJ_KEEP if resp.get(k) not in (None, "", [])}
+        slim = {
+            k: v for k, v in resp.items()
+            if k not in _RESPONSE_OBJ_NOISE and v not in (None, "", [])
+        }
         msg = str(resp.get("message", "")).lower()
         slim["success"] = bool(
             resp.get("success")
@@ -1092,6 +1113,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         )
     if name == "scan_broken_locators":
         return await clients.asset.list_broken_locators()
+    if name == "find_locator_usage":
+        return await _find_locator_usage(
+            clients, args["locator_id"],
+            include_common_functions=args.get("include_common_functions", True))
     if name == "heal_locator":
         return await _heal_locator(
             clients.asset, args["locator_id"], args["website_id"],
@@ -1106,12 +1131,19 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "list_test_scripts":
         return await clients.test_mgmt.list_test_scripts(args.get("name"))
     if name == "get_test_script":
-        return await clients.test_mgmt.get_test_script(args["script_id"])
+        script = await clients.test_mgmt.get_test_script(args["script_id"])
+        return _paginate_script(
+            script,
+            steps_from=args.get("steps_from"),
+            steps_to=args.get("steps_to"),
+            summary=args.get("summary", False),
+        )
     if name == "delete_test_script":
         return await clients.test_mgmt.delete_test_script(
             args["script_id"], args.get("confirmed", False)
         )
-    if name in ("add_test_steps", "update_test_script") and not args.get("branch_name"):
+    if name in ("add_test_steps", "update_test_script", "delete_test_steps",
+                "reorder_test_steps") and not args.get("branch_name"):
         # Omitting it lands the edit on whatever branch the token is ambiently pointed at: the PUT
         # is a full-document write and the GET's currentBranchName is the request's branch, not the
         # script's (see TestMgmtClient._put_script). The edit still reports success, so the damage
@@ -1132,12 +1164,26 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "add_test_steps":
         return await clients.test_mgmt.add_test_steps(
             args["script_id"], args["steps"], args.get("position"),
-            branch_name=args.get("branch_name"))
+            branch_name=args.get("branch_name"),
+            expected_version=args.get("expected_version"))
+    if name == "delete_test_steps":
+        return await clients.test_mgmt.delete_test_steps(
+            args["script_id"],
+            sequences=args.get("sequences"),
+            step_ids=args.get("step_ids"),
+            branch_name=args.get("branch_name"),
+            expected_version=args.get("expected_version"))
+    if name == "reorder_test_steps":
+        return await clients.test_mgmt.reorder_test_steps(
+            args["script_id"], args["order"],
+            branch_name=args.get("branch_name"),
+            expected_version=args.get("expected_version"))
     if name == "update_test_script":
         # branch_name is a sibling of `changes`, not one of the entity fields inside it — it
         # selects WHERE the edit lands rather than what the document says.
         return await clients.test_mgmt.update_test_script(
-            args["script_id"], branch_name=args.get("branch_name"), **args["changes"])
+            args["script_id"], branch_name=args.get("branch_name"),
+            expected_version=args.get("expected_version"), **args["changes"])
     if name == "create_test_script":
         # Schema `required` is advisory — not every MCP client enforces it — and this is the one
         # argument whose wrong value fails silently much later: a script created on protected
@@ -1574,6 +1620,8 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             report = await clients.executor.get_execution_results(resolved)
             report = {**report, "resolvedFromJobId": execution_id,
                       "executionId": resolved} if isinstance(report, dict) else report
+        if args.get("summary") or args.get("failed_only"):
+            return _summarize_report(report, failed_only=args.get("failed_only", False))
         return report
     if name == "get_performance_report":
         return await clients.executor.get_performance_report(args["execution_id"])

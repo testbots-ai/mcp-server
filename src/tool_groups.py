@@ -43,6 +43,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "healing": (
         "scan_broken_locators",
+        "find_locator_usage",
         "heal_locator",
         "apply_locator_fix",
     ),
@@ -52,6 +53,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "delete_test_script",
         "add_test_steps",
         "update_test_script",
+        "delete_test_steps",
+        "reorder_test_steps",
         "create_test_script",
         "list_step_templates",
         "search_step_templates",

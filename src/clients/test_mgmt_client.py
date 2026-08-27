@@ -214,34 +214,161 @@ class TestMgmtClient(BaseAhqClient):
             result["branchName"] = landed
         return result
 
-    async def update_test_script(self, script_id: str, branch_name: str = None, **changes) -> dict:
+    async def update_test_script(self, script_id: str, branch_name: str = None,
+                                 expected_version: int = None, **changes) -> dict:
         # PUT /rest/api/stories/scripts/{id} is a full-document update — same GET-merge-PUT
         # discipline as update_common_function so a partial body can never wipe fields.
         # NOTE: direct edits to a script on a PROTECTED branch (often "main") 403 with
         # "Create a working branch and use a Pull Request" — that error is the platform's
         # version-control policy, not a client bug.
-        current = await self.get_test_script(script_id)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        if refusal:
+            return refusal
         if "testSteps" in changes:
             changes["testSteps"] = _normalize_step_parameters(changes["testSteps"])
         current.update(changes)
-        return await self._put_script(script_id, current, branch_name)
+        return await self._put_script_if_unchanged(script_id, current, branch_name, version)
 
     async def add_test_steps(
-        self, script_id: str, steps: list, position: int = None, branch_name: str = None
+        self, script_id: str, steps: list, position: int = None, branch_name: str = None,
+        expected_version: int = None,
     ) -> dict:
         """
         Append (or insert at `position`, 0-based) steps to an existing script — the single-call
         replacement for the fetch-spec/read-controller/hand-build-PUT detour. Sequences are
         renumbered across the whole script.
         """
-        current = await self.get_test_script(script_id)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        if refusal:
+            return refusal
         existing = current.get("testSteps") or []
         pos = len(existing) if position is None else max(0, min(position, len(existing)))
         merged = existing[:pos] + _normalize_step_parameters(list(steps)) + existing[pos:]
         for i, step in enumerate(merged, start=1):
             step["sequence"] = i
         current["testSteps"] = merged
-        return await self._put_script(script_id, current, branch_name)
+        return await self._put_script_if_unchanged(script_id, current, branch_name, version)
+
+    async def _steps_for_edit(self, script_id: str, expected_version):
+        """
+        Read a script for an edit, refusing if it has moved since the caller last looked.
+        `versionCount` is TestScript's monotonic counter across all branches, so an unchanged
+        value means nobody else has written since.
+
+        This exists because every script edit here is GET-merge-PUT with no server-side
+        optimistic locking: two writers who both read version N each PUT a full document built
+        from it, and the second silently erases the first's steps while both calls report
+        success. That is not hypothetical — two agents editing one script concurrently produced
+        a duplicated block and two steps spliced into the middle of a form-entry sequence, and
+        nothing in either response indicated a collision.
+        """
+        current = await self.get_test_script(script_id)
+        if not isinstance(current, dict):
+            return None, None, {"error": f"Script {script_id} response was not a document: {current}"}
+        version = current.get("versionCount")
+        if expected_version is not None and version != expected_version:
+            return None, None, {"error": (
+                f"Concurrent edit refused: script {script_id} is at versionCount {version}, but "
+                f"expected_version was {expected_version}. Someone (or another agent) changed "
+                f"this script after you read it. Re-read it with get_test_script, rebuild the "
+                f"change against the current steps, and retry."
+            )}
+        return current, version, None
+
+    async def _put_script_if_unchanged(self, script_id: str, document: dict,
+                                       branch_name: str, seen_version):
+        """
+        Last check before the write: re-read the script and bail if `versionCount` moved while
+        this edit was being assembled. Closes the read-modify-write window itself, so a caller
+        who never passes expected_version still cannot silently overwrite a concurrent edit.
+        """
+        latest = await self.get_test_script(script_id)
+        if isinstance(latest, dict) and seen_version is not None:
+            current_version = latest.get("versionCount")
+            if current_version != seen_version:
+                return {"error": (
+                    f"Concurrent edit refused: script {script_id} changed from versionCount "
+                    f"{seen_version} to {current_version} while this edit was being prepared — "
+                    f"another writer is active on it right now. Nothing was written. Re-read the "
+                    f"script and retry."
+                )}
+        return await self._put_script(script_id, document, branch_name)
+
+    async def delete_test_steps(self, script_id: str, sequences: list = None,
+                                step_ids: list = None, branch_name: str = None,
+                                expected_version: int = None) -> dict:
+        """
+        Remove specific steps by 1-based `sequence` and/or `testStepId`, renumbering what remains.
+
+        Without this, deleting one step from a 75-step script meant fetching the whole script,
+        rebuilding the entire corrected testSteps array by hand, and PUTting all 75 back — an
+        all-or-nothing rewrite where a slip damages steps nobody meant to touch.
+        """
+        if not sequences and not step_ids:
+            return {"error": "Pass sequences and/or step_ids — nothing to delete."}
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        if refusal:
+            return refusal
+
+        existing = current.get("testSteps") or []
+        drop_seq = set(sequences or [])
+        drop_ids = set(step_ids or [])
+        kept, removed = [], []
+        for step in existing:
+            if step.get("sequence") in drop_seq or step.get("testStepId") in drop_ids:
+                removed.append({"sequence": step.get("sequence"),
+                                "testStepId": step.get("testStepId"),
+                                "testStepTitle": step.get("testStepTitle")})
+            else:
+                kept.append(step)
+
+        matched_seq = {r["sequence"] for r in removed}
+        matched_ids = {r["testStepId"] for r in removed}
+        unmatched_seq = sorted(drop_seq - matched_seq)
+        unmatched_ids = sorted(drop_ids - matched_ids)
+        if unmatched_seq or unmatched_ids:
+            # Deleting the wrong steps is unrecoverable, so a request that does not describe the
+            # script the caller thinks it does must not be half-applied.
+            return {"error": (
+                f"Nothing was deleted — these did not match any step in script {script_id}: "
+                f"sequences={unmatched_seq or []}, step_ids={unmatched_ids or []}. The script has "
+                f"{len(existing)} steps (sequences 1 to {len(existing)}). Re-read it and retry."
+            )}
+
+        for index, step in enumerate(kept, start=1):
+            step["sequence"] = index
+        current["testSteps"] = kept
+        result = await self._put_script_if_unchanged(script_id, current, branch_name, version)
+        if isinstance(result, dict) and "error" not in result:
+            result["removed_steps"] = removed
+            result["remaining_step_count"] = len(kept)
+        return result
+
+    async def reorder_test_steps(self, script_id: str, order: list,
+                                 branch_name: str = None, expected_version: int = None) -> dict:
+        """
+        Reorder steps by listing their CURRENT 1-based sequences in the order they should end up.
+        `order` must be a permutation of every existing sequence — a partial list is rejected
+        rather than guessed at, since the missing steps' fate would be ambiguous.
+        """
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        if refusal:
+            return refusal
+
+        existing = current.get("testSteps") or []
+        expected = list(range(1, len(existing) + 1))
+        if sorted(order) != expected:
+            return {"error": (
+                f"order must be a permutation of every current sequence {expected} — got {order}. "
+                f"Nothing was written. List all {len(existing)} sequences in their new order."
+            )}
+
+        by_sequence = {step.get("sequence"): step for step in existing}
+        reordered = [by_sequence[seq] for seq in order]
+        for index, step in enumerate(reordered, start=1):
+            step["sequence"] = index
+        current["testSteps"] = reordered
+        return await self._put_script_if_unchanged(script_id, current, branch_name, version)
 
     # --- Epics ---
     async def list_epics(self) -> list:

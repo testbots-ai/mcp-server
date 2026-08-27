@@ -44,7 +44,8 @@ class ConfigClient(BaseAhqClient):
 
     async def list_grids(self) -> list:
         result = await self.get("/rest/api/grids", params=self._LOOKUP_PAGING)
-        return result if isinstance(result, list) else result.get("content", result)
+        grids = result if isinstance(result, list) else result.get("content", result)
+        return _annotate_dead_grid_status(grids)
 
     async def get_grid(self, grid_id: str) -> dict:
         return await self.get(f"/rest/api/grids/{grid_id}")
@@ -151,3 +152,31 @@ class ConfigClient(BaseAhqClient):
     # both return the DECRYPTED PLAINTEXT secret value directly. Exposing either as an MCP tool would
     # put real credentials into the conversation transcript — the same policy already established for
     # mtaf-core's vault (see managed_testing_client.py's list_vault_secrets docstring).
+
+
+_GRID_STATUS_NOT_LIVE = (
+    "NOT REPORTED — the platform stores no heartbeat for this grid (lastSeen is null), so this "
+    "field is not a live connectivity signal and must not be used to choose an execution target. "
+    "For the local agent use check_local_agent_status; for a cloud grid, submit the run."
+)
+
+
+def _annotate_dead_grid_status(grids):
+    """
+    `status`/`activeSessionCount`/`lastSeen` are declared on the grid document but nothing writes
+    them: every grid in a live project reads OFFLINE / 0 / null at once, including a grid the user
+    has just brought up and one that goes on to run a suite successfully. Reported verbatim, that
+    is worse than absent — a caller picking a target reads a uniform "OFFLINE" as real and either
+    avoids a working grid or distrusts the whole response.
+
+    A null `lastSeen` is the tell that nothing ever populated the row, so the replacement is
+    conditional on it: if the platform ever starts writing heartbeats, the real status flows
+    through untouched and this annotation disappears on its own.
+    """
+    if not isinstance(grids, list):
+        return grids
+    for grid in grids:
+        if isinstance(grid, dict) and grid.get("lastSeen") is None and "status" in grid:
+            grid["reportedStatus"] = grid["status"]
+            grid["status"] = _GRID_STATUS_NOT_LIVE
+    return grids

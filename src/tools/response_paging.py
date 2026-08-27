@@ -1,0 +1,148 @@
+"""
+Summary and range views for the two responses that routinely blow the tool-result token cap:
+a full test script and a full execution report.
+
+Both are normal-sized project data — a 60-90 step script, an 11-script run — not pathological
+cases, and both were failing outright with "result exceeds maximum allowed tokens". A failed
+fetch is worse than a big one: the caller learns nothing and has to reconstruct the data by
+saving it to a file and grepping it back in chunks, which is a workaround for a missing
+parameter, on nearly every diagnostic step.
+
+The whole document is still available; these only add ways to ask for less of it.
+"""
+
+
+def _step_digest(step: dict) -> dict:
+    """One line per step: enough to find the step you want, not enough to blow the cap."""
+    digest = {
+        "sequence": step.get("sequence"),
+        "testStepId": step.get("testStepId"),
+        "title": step.get("testStepTitle") or step.get("templateTitle"),
+    }
+    if step.get("subTestSteps"):
+        digest["subStepCount"] = len(step["subTestSteps"])
+    if step.get("skip"):
+        digest["skip"] = True
+    return digest
+
+
+def paginate_script(script: dict, steps_from: int = None, steps_to: int = None,
+                    summary: bool = False) -> dict:
+    """
+    Trim a test script's `testSteps` without touching any other field.
+
+    `steps_from`/`steps_to` are INCLUSIVE 1-based sequence bounds, matching the numbers a step
+    actually carries and the numbers delete_test_steps/reorder_test_steps take — an off-by-one
+    between "the step numbered 5" and "index 5" is exactly the kind of slip that deletes the
+    wrong step.
+    """
+    if not isinstance(script, dict):
+        return script
+    steps = script.get("testSteps")
+    if not isinstance(steps, list):
+        return script
+
+    total = len(steps)
+    if summary:
+        trimmed = dict(script)
+        trimmed["testSteps"] = [_step_digest(s) for s in steps if isinstance(s, dict)]
+        trimmed["stepView"] = {
+            "mode": "summary",
+            "totalSteps": total,
+            "note": ("Step titles only. Re-call get_test_script with steps_from/steps_to for the "
+                     "full parameters of a specific range, or omit both for the whole script."),
+        }
+        return trimmed
+
+    if steps_from is None and steps_to is None:
+        return script
+
+    low = 1 if steps_from is None else max(1, steps_from)
+    high = total if steps_to is None else min(total, steps_to)
+    selected = [s for s in steps
+                if isinstance(s, dict) and low <= (s.get("sequence") or 0) <= high]
+
+    trimmed = dict(script)
+    trimmed["testSteps"] = selected
+    trimmed["stepView"] = {
+        "mode": "range",
+        "from": low,
+        "to": high,
+        "showing": len(selected),
+        "totalSteps": total,
+    }
+    return trimmed
+
+
+def _iter_script_results(report: dict):
+    """
+    Walk the report's nested suite → script → iteration → step shape, yielding each script-level
+    result with the suite it came from. Written defensively: the report nests differently
+    depending on how many suites a bot carries, and a shape assumption here would turn a working
+    summary into an empty one.
+    """
+    for suite in report.get("testSuiteResults") or report.get("suiteResults") or []:
+        if not isinstance(suite, dict):
+            continue
+        scripts = suite.get("testScriptResults") or suite.get("scriptResults") or []
+        for script in scripts:
+            if isinstance(script, dict):
+                yield suite, script
+
+
+def summarize_report(report: dict, failed_only: bool = False) -> dict:
+    """
+    Collapse an execution report to one row per script, optionally only the ones that failed.
+
+    Answers "which scripts failed and where" — the actual question behind almost every report
+    fetch — without carrying every passing step's parameters and screenshot URLs along with it.
+    """
+    if not isinstance(report, dict):
+        return report
+
+    rows = []
+    for suite, script in _iter_script_results(report):
+        status = script.get("status") or script.get("executionStatus")
+        failed = str(status).upper() not in ("PASSED", "PASS", "SUCCESS")
+        if failed_only and not failed:
+            continue
+
+        row = {
+            "suite": suite.get("name") or suite.get("testSuiteName"),
+            "script": script.get("name") or script.get("testScriptName"),
+            "testScriptId": script.get("testScriptId"),
+            "status": status,
+        }
+
+        # First failing step per script — the single most useful field in the whole report, and
+        # the one the token cap was reliably hiding.
+        for iteration in script.get("iterations") or []:
+            if not isinstance(iteration, dict):
+                continue
+            if iteration.get("errorMessage"):
+                row["errorMessage"] = iteration["errorMessage"]
+            for step in iteration.get("testStepResults") or iteration.get("stepResults") or []:
+                if not isinstance(step, dict):
+                    continue
+                step_status = str(step.get("status") or "").upper()
+                if step_status and step_status not in ("PASSED", "PASS", "SUCCESS"):
+                    row["firstFailedStep"] = {
+                        "sequence": step.get("sequence"),
+                        "title": step.get("testStepName") or step.get("testStepTitle"),
+                        "status": step.get("status"),
+                        "statusMessage": step.get("statusMessage"),
+                    }
+                    break
+            if "firstFailedStep" in row:
+                break
+        rows.append(row)
+
+    return {
+        "executionId": report.get("executionId") or report.get("id"),
+        "status": report.get("status") or report.get("executionStatus"),
+        "view": "failed_only" if failed_only else "summary",
+        "scriptCount": len(rows),
+        "scripts": rows,
+        "note": ("One row per script. For a specific script's full per-step detail, call "
+                 "get_execution_report again with summary=false."),
+    }

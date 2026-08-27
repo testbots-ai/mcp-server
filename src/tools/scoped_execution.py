@@ -7,6 +7,31 @@ import time
 from typing import Optional
 
 
+def _extract_id(created: dict, *keys: str):
+    """
+    AHQ create endpoints answer with a ResponseObj whose `id` carries the new entity id, but
+    some handlers echo the entity itself instead. Accept either rather than reading one shape
+    and reporting "could not create" for a resource that was in fact created.
+    """
+    if not isinstance(created, dict):
+        return None
+    for key in ("id", *keys):
+        if created.get(key):
+            return created[key]
+    return None
+
+
+def _suite_entry(script_id: str, script: dict) -> list:
+    """The embedded TestScriptForTestSuiteView a suite carries for one script."""
+    return [{
+        "testScriptId": script_id,
+        "name": script.get("name", ""),
+        "status": script.get("status"),
+        "selected": True,
+        "sequence": 1,
+    }]
+
+
 async def execute_script_only(
     clients,
     script_id: str,
@@ -46,38 +71,32 @@ async def execute_script_only(
 
     script_name = script.get("name", f"Script {script_id}")
 
-    # Create a temporary suite with just this script
+    # Create a temporary suite carrying just this script. Scripts are embedded in the suite
+    # document, so they go in on the create call — a follow-up add_scripts_to_suite would be a
+    # second round trip and a second way for this to half-succeed.
     try:
         suite_name = f"[SCOPED] {script_name} - {int(time.time())}"
         suite = await clients.test_mgmt.create_suite(
-            name=suite_name,
-            description="Temporary single-script execution — auto-created by execute_script_only"
+            suite_name,
+            _suite_entry(script_id, script),
         )
-        suite_id = suite.get("id") or suite.get("testSuiteId")
+        suite_id = _extract_id(suite, "testSuiteId")
         if not suite_id:
             return {"error": f"Could not create temporary suite: {suite}"}
     except Exception as e:
         return {"error": f"Failed to create temporary suite: {e}"}
 
-    # Add the script to the suite
-    try:
-        await clients.test_mgmt.add_scripts_to_suite(
-            suite_id=suite_id,
-            script_ids=[script_id]
-        )
-    except Exception as e:
-        return {"error": f"Failed to add script to temporary suite: {e}. Suite {suite_id} should be cleaned up."}
-
-    # Create a temporary bot with just this suite
+    # Create a temporary bot with just this suite. botType is deliberately not sent: it is a
+    # {type, value} pair from list_bot_types, not a bare string, and the server defaults it to
+    # REGRESSION_TEST on its own.
     try:
         bot_name = f"[SCOPED] {script_name} - {int(time.time())}"
         bot = await clients.test_mgmt.create_test_bot(
-            name=bot_name,
-            bot_type="CUSTOM",
-            suite_ids=[suite_id],
-            description="Temporary single-script execution — auto-created by execute_script_only"
+            bot_name,
+            [{"testSuiteId": suite_id, "name": suite_name}],
+            description="Temporary single-script execution — auto-created by execute_script_only",
         )
-        bot_id = bot.get("id") or bot.get("testBotId")
+        bot_id = _extract_id(bot, "testBotId")
         if not bot_id:
             return {"error": f"Could not create temporary bot: {bot}. Suite {suite_id} should be cleaned up."}
     except Exception as e:
@@ -156,21 +175,22 @@ async def execute_script_step_by_step(
     try:
         suite_name = f"[SCOPED-DEBUG] {script_name} - {int(time.time())}"
         suite = await clients.test_mgmt.create_suite(
-            name=suite_name,
-            description="Temporary single-script execution (partial) — auto-created by execute_script_step_by_step"
+            suite_name,
+            _suite_entry(script_id, script),
         )
-        suite_id = suite.get("id") or suite.get("testSuiteId")
-
-        await clients.test_mgmt.add_scripts_to_suite(suite_id=suite_id, script_ids=[script_id])
+        suite_id = _extract_id(suite, "testSuiteId")
+        if not suite_id:
+            return {"error": f"Could not create temporary suite: {suite}"}
 
         bot_name = f"[SCOPED-DEBUG] {script_name} - {int(time.time())}"
         bot = await clients.test_mgmt.create_test_bot(
-            name=bot_name,
-            bot_type="CUSTOM",
-            suite_ids=[suite_id],
-            description="Temporary single-script partial execution"
+            bot_name,
+            [{"testSuiteId": suite_id, "name": suite_name}],
+            description="Temporary single-script partial execution",
         )
-        bot_id = bot.get("id") or bot.get("testBotId")
+        bot_id = _extract_id(bot, "testBotId")
+        if not bot_id:
+            return {"error": f"Could not create temporary bot: {bot}. Suite {suite_id} should be cleaned up."}
     except Exception as e:
         return {"error": f"Failed to set up temporary resources: {e}"}
 
