@@ -126,5 +126,27 @@ def test_nested_sub_steps_are_searched():
     assert "nested_secret" in describe_credentials(script)["references"]
 
 
+# --- video has to be REQUESTED, not just surfaced ----------------------------------------------
+
+def test_video_recording_is_settable_and_reaches_the_payload():
+    """
+    Surfacing videoUrl is useless if no run ever records one. Capture is gated server-side on
+    executionConfiguration.isVideoRecording(); the grid advertising videoRecording: true is NOT
+    enough. Confirmed live on a Selenium Hub run whose grid advertises it: videoUrl was null on
+    both the passing and the failing iteration, because the flag was never sent.
+    """
+    from src.schema.asset_kinds import RunExecutionConfiguration
+
+    base = dict(baseUrl="env-1", browser="Chrome", gridId="g1",
+                browserVersion="latest", osType="Linux")
+
+    on = RunExecutionConfiguration(**base, videoRecording=True).model_dump(exclude_none=True)
+    assert on["videoRecording"] is True
+
+    # Off by default: the post-run path polls storage for the file, which costs time on every run.
+    off = RunExecutionConfiguration(**base).model_dump(exclude_none=True)
+    assert off["videoRecording"] is False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

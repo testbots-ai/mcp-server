@@ -169,6 +169,14 @@ class RunExecutionConfiguration(_Args):
     screenshotAfterEachStep: bool = False
     screenshotOnError: bool = True
     screenshotOnFinish: bool = True
+    # Video capture is gated server-side on THIS flag, not on the grid's own videoRecording
+    # field: RemoteExecutionStatusHandler only looks for a recording when
+    # executionConfiguration.isVideoRecording() is true. Absent here, it defaults false, so every
+    # MCP-triggered run produced IterationResult.videoUrl = null — confirmed live on a Selenium
+    # Hub run whose GRID advertises videoRecording: true, on both a passing and a failing
+    # iteration. Not defaulted true: the post-run path polls storage for the file, which costs
+    # time on every run whether or not anyone wants the recording.
+    videoRecording: bool = False
     excludeToBeRepairedTest: bool = False
     closeBrowserAfterEachExecution: bool = True
     customProperties: list = Field(default_factory=list)
