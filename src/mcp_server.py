@@ -366,10 +366,11 @@ TOOLS = [
         description=(
             "Projects the signed-in user personally has a role in, across every organization they "
             "belong to. Call this before creating anything when the user has not named a project: "
-            "115 of ~1800 live users hold roles in more than one, and there is no way to tell from "
-            "a later error which one they meant. Ask them to choose, then pass the chosen id as "
+            "a user may hold roles in more than one, and there is no way to tell from a later "
+            "error which one they meant. Ask them to choose, then pass the chosen id as "
             "project_id on subsequent calls — the server keeps no per-session project, so the "
-            "choice only persists if you carry it."
+            "choice only persists if you carry it. This result lists THIS account's projects; it "
+            "is not evidence about any other account."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),

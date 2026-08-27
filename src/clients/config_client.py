@@ -45,10 +45,11 @@ class ConfigClient(BaseAhqClient):
     async def list_grids(self) -> list:
         result = await self.get("/rest/api/grids", params=self._LOOKUP_PAGING)
         grids = result if isinstance(result, list) else result.get("content", result)
-        return _annotate_dead_grid_status(grids)
+        return _annotate_dead_grid_status(_redact_grid_credentials(grids))
 
     async def get_grid(self, grid_id: str) -> dict:
-        return await self.get(f"/rest/api/grids/{grid_id}")
+        grid = await self.get(f"/rest/api/grids/{grid_id}")
+        return _annotate_dead_grid_status(_redact_grid_credentials(grid))
 
     async def list_browsers(self) -> list:
         result = await self.get("/rest/api/browsers", params=self._LOOKUP_PAGING)
@@ -179,4 +180,69 @@ def _annotate_dead_grid_status(grids):
         if isinstance(grid, dict) and grid.get("lastSeen") is None and "status" in grid:
             grid["reportedStatus"] = grid["status"]
             grid["status"] = _GRID_STATUS_NOT_LIVE
+    return grids
+
+
+# Values the platform stores when a grid needs no credentials. Masking these would be noise, and
+# would hide the useful fact that the grid is open.
+_CREDENTIAL_PLACEHOLDERS = frozenset({"", "no_key", "no_user", "no_secret", "none", "null"})
+
+_REDACTED = "[redacted — the MCP layer never returns grid credentials]"
+
+
+def _looks_like_a_secret(value) -> bool:
+    return isinstance(value, str) and value.strip().lower() not in _CREDENTIAL_PLACEHOLDERS
+
+
+def _strip_userinfo(url: str) -> str:
+    """
+    Remove a `user:pass@` prefix from a grid URL, keeping the scheme, host, port and path so the
+    grid is still identifiable. Hand-parsed rather than via urlsplit/urlunsplit so a URL this
+    client does not fully understand is returned unchanged instead of silently reassembled.
+    """
+    marker = "://"
+    scheme_end = url.find(marker)
+    if scheme_end == -1:
+        return url
+    rest_start = scheme_end + len(marker)
+    authority_end = len(url)
+    for sep in ("/", "?", "#"):
+        found = url.find(sep, rest_start)
+        if found != -1:
+            authority_end = min(authority_end, found)
+    authority = url[rest_start:authority_end]
+    at = authority.rfind("@")
+    if at == -1:
+        return url
+    return url[:rest_start] + authority[at + 1:] + url[authority_end:]
+
+
+def _redact_grid_credentials(grids):
+    """
+    Strip working credentials out of grid records before they reach the model.
+
+    A grid document carries `accessKey` in plaintext and repeats it inside `url` as
+    `https://user:key@hub.browserstack.com/wd/hub`. Returned verbatim, every list_grids call
+    writes usable BrowserStack/TestingBot credentials into the conversation transcript, which is
+    then stored, and for hosted deployments leaves the machine entirely.
+
+    Nothing needs them: execute_bot selects a grid by `gridId` and the platform attaches its own
+    credentials server-side. `username` is deliberately kept — it identifies the account and is
+    useless on its own once the key is gone.
+    """
+    if isinstance(grids, dict):
+        return _redact_grid_credentials([grids])[0]
+    if not isinstance(grids, list):
+        return grids
+    for grid in grids:
+        if not isinstance(grid, dict):
+            continue
+        if _looks_like_a_secret(grid.get("accessKey")):
+            grid["accessKey"] = _REDACTED
+        url = grid.get("url")
+        if isinstance(url, str):
+            stripped = _strip_userinfo(url)
+            if stripped != url:
+                grid["url"] = stripped
+                grid["urlCredentials"] = _REDACTED
     return grids
