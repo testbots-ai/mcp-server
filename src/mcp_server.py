@@ -34,6 +34,7 @@ from src.tools.scoped_execution import (
 from src.tools.locator_usage import find_locator_usage as _find_locator_usage
 from src.tools import locator_validation as _locval
 from src.tools.script_identity import describe_credentials as _describe_credentials
+from src.tools import edit_verification as _editver
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -965,6 +966,14 @@ async def _resolve_locators_for_script(clients, script_id: str, steps) -> dict:
     return resolution
 
 
+def _attach_staleness(run, stale_scripts, execution_configuration):
+    """Ride the uncommitted-edit warning along with a submitted run, without blocking it."""
+    if stale_scripts and isinstance(run, dict):
+        run["staleness"] = _editver.staleness_warning(
+            stale_scripts, execution_configuration.get("targetBranchName"))
+    return run
+
+
 async def _dispatch_hosted(name: str, arguments: dict, clients: ClientBundle):
     """
     Hosted-only wrapper: per-org rate limiting plus one audit line per tool call. Tool
@@ -1199,19 +1208,20 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             args["script_id"], args["steps"], args.get("position"),
             branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"))
-        return _locval.annotate(result, resolution)
+        return _editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name"))
     if name == "delete_test_steps":
-        return await clients.test_mgmt.delete_test_steps(
+        return _editver.annotate_edit(await clients.test_mgmt.delete_test_steps(
             args["script_id"],
             sequences=args.get("sequences"),
             step_ids=args.get("step_ids"),
             branch_name=args.get("branch_name"),
-            expected_version=args.get("expected_version"))
+            expected_version=args.get("expected_version")), args.get("branch_name"))
     if name == "reorder_test_steps":
-        return await clients.test_mgmt.reorder_test_steps(
+        return _editver.annotate_edit(await clients.test_mgmt.reorder_test_steps(
             args["script_id"], args["order"],
             branch_name=args.get("branch_name"),
-            expected_version=args.get("expected_version"))
+            expected_version=args.get("expected_version")), args.get("branch_name"))
     if name == "update_test_script":
         # branch_name is a sibling of `changes`, not one of the entity fields inside it — it
         # selects WHERE the edit lands rather than what the document says.
@@ -1225,7 +1235,8 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         result = await clients.test_mgmt.update_test_script(
             args["script_id"], branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"), **changes)
-        return _locval.annotate(result, resolution)
+        return _editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name"))
     if name == "create_test_script":
         # Schema `required` is advisory — not every MCP client enforces it — and this is the one
         # argument whose wrong value fails silently much later: a script created on protected
@@ -1264,7 +1275,8 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         result = await clients.test_mgmt.create_test_script(
             args["name"], args["steps"], args.get("page_id"), args.get("website_id"), args.get("story_id"), **kwargs
         )
-        return _locval.annotate(result, resolution)
+        return _editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name"))
 
     if name == "list_step_templates":
         return await clients.test_mgmt.list_templates(args.get("offset", 0))
@@ -1526,6 +1538,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         preflight = await _preflight_execution_configuration(clients, execution_configuration)
         if preflight:
             return preflight
+        # A run tests the last COMMITTED version, so an uncommitted edit is silently absent from
+        # it. Advisory, never blocking — the run still goes ahead and the warning rides with it.
+        stale_scripts = await _editver.uncommitted_scripts_on(
+            clients, execution_configuration.get("targetBranchName"))
         # The UI's run dialog always sends a display name; this tool left it optional and the
         # caller rarely passes one, so Claude-triggered runs showed up unnamed in Test
         # Reports and could not be told apart. The bot name plus a timestamp is what the
@@ -1555,14 +1571,16 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             # the cloud entirely — see _is_local_grid's docstring. profile_id/partial_execution
             # are cloud-executor-only concepts (never seen in the browser's direct-to-agent
             # request) and are not supported on this path.
-            return await clients.local_exec.execute_bot_locally(
+            run = await clients.local_exec.execute_bot_locally(
                 args["bot_id"], execution_configuration, name=args.get("name"),
             )
-        return await clients.executor.execute_bot(
+            return _attach_staleness(run, stale_scripts, execution_configuration)
+        run = await clients.executor.execute_bot(
             args["bot_id"], execution_configuration,
             name=args.get("name"), profile_id=args.get("profile_id"),
             partial_execution=args.get("partial_execution", False),
         )
+        return _attach_staleness(run, stale_scripts, execution_configuration)
     if name == "get_execution_status":
         status = await clients.executor.get_bot_execution_status(args["execution_id"])
         # The lightweight status endpoint reports UNKNOWN once the run leaves the queue (and for
