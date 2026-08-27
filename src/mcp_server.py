@@ -33,6 +33,7 @@ from src.tools.scoped_execution import (
 )
 from src.tools.locator_usage import find_locator_usage as _find_locator_usage
 from src.tools import locator_validation as _locval
+from src.tools.script_identity import describe_credentials as _describe_credentials
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -682,7 +683,7 @@ TOOLS = [
     Tool(name="list_recent_runs", description="List recent execution reports. With bot_id: that bot's execution history; without: the report list across bots. Start here to find the execution_id that get_execution_report needs.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "limit": {"type": "integer", "default": 10}}}),
 
     # Reporting
-    Tool(name="get_execution_report", description="Screenshots ride in this report as screenshotUrl per iteration — there is no separate screenshots call. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}, "summary": {"type": "boolean", "description": "One row per script (status + first failing step). Use first on a multi-script run — the full report routinely exceeds the token cap"}, "failed_only": {"type": "boolean", "description": "Summary, failed scripts only"}}, "required": ["execution_id"]}),
+    Tool(name="get_execution_report", description="Screenshots AND the run's video recording ride in this report — screenshotUrl and videoUrl per iteration; there is no separate call for either. Watch the video before theorising about a failure. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}, "summary": {"type": "boolean", "description": "One row per script (status + first failing step). Use first on a multi-script run — the full report routinely exceeds the token cap"}, "failed_only": {"type": "boolean", "description": "Summary, failed scripts only"}}, "required": ["execution_id"]}),
     Tool(name="get_performance_report", description="Duration and ROI/time-saved metrics for an ordinary UI execution, by execution_id. Pass/fail detail is get_execution_report on the same id. Unrelated to get_performance_results, which polls a JMeter load test.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
 
     # Application context
@@ -1152,12 +1153,18 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         return await clients.test_mgmt.list_test_scripts(args.get("name"))
     if name == "get_test_script":
         script = await clients.test_mgmt.get_test_script(args["script_id"])
-        return _paginate_script(
+        # Computed from steps already in hand — no extra call, and nothing is added for the
+        # majority of scripts that never sign in.
+        credentials = _describe_credentials(script)
+        view = _paginate_script(
             script,
             steps_from=args.get("steps_from"),
             steps_to=args.get("steps_to"),
             summary=args.get("summary", False),
         )
+        if credentials and isinstance(view, dict):
+            view = {**view, "credentialSources": credentials}
+        return view
     if name == "delete_test_script":
         return await clients.test_mgmt.delete_test_script(
             args["script_id"], args.get("confirmed", False)

@@ -114,6 +114,12 @@ def summarize_report(report: dict, failed_only: bool = False) -> dict:
             "status": status,
         }
 
+        # Media links, carried into the summary deliberately. A summary whose whole purpose is
+        # "why did this fail" that drops the recording of the failure sends the reader back to the
+        # full report, which is what the summary exists to avoid.
+        media = _media_for_script(script)
+        row.update(media)
+
         # First failing step per script — the single most useful field in the whole report, and
         # the one the token cap was reliably hiding.
         for iteration in script.get("iterations") or []:
@@ -143,6 +149,31 @@ def summarize_report(report: dict, failed_only: bool = False) -> dict:
         "view": "failed_only" if failed_only else "summary",
         "scriptCount": len(rows),
         "scripts": rows,
-        "note": ("One row per script. For a specific script's full per-step detail, call "
-                 "get_execution_report again with summary=false."),
+        "note": ("One row per script. videoUrl, when present, is the recording of that "
+                 "script's run — watch it before theorising about a failure. For full per-step "
+                 "detail call get_execution_report again with summary=false."),
     }
+
+
+def _media_for_script(script: dict) -> dict:
+    """
+    First screenshot and video URL across a script's iterations.
+
+    Video is recorded per grid session and lands on IterationResult.videoUrl (and on the run's
+    GridInfo for BrowserStack/TestingBot). It has always been in this payload and nothing ever
+    pointed at it, so failures were debugged from step text alone while the recording sat unused.
+    """
+    out = {}
+    for iteration in script.get("iterations") or []:
+        if not isinstance(iteration, dict):
+            continue
+        if "videoUrl" not in out and iteration.get("videoUrl"):
+            out["videoUrl"] = iteration["videoUrl"]
+        if "screenshotUrl" not in out and iteration.get("screenshotUrl"):
+            out["screenshotUrl"] = iteration["screenshotUrl"]
+        if len(out) == 2:
+            break
+    grid = script.get("gridInfo")
+    if "videoUrl" not in out and isinstance(grid, dict) and grid.get("videoUrl"):
+        out["videoUrl"] = grid["videoUrl"]
+    return out
