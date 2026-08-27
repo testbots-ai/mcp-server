@@ -102,7 +102,12 @@ def summarize_report(report: dict, failed_only: bool = False) -> dict:
 
     rows = []
     for suite, script in _iter_script_results(report):
-        status = script.get("status") or script.get("executionStatus")
+        # Field order matters and was got wrong once: the live detailed-results payload uses
+        # resultStatus at BOTH script and step level. Reading only status/executionStatus
+        # returned null for every script and silently suppressed firstFailedStep entirely —
+        # the single most useful field in the summary. Confirmed against execution fd49b18e.
+        status = (script.get("resultStatus") or script.get("status")
+                  or script.get("executionStatus"))
         failed = str(status).upper() not in ("PASSED", "PASS", "SUCCESS")
         if failed_only and not failed:
             continue
@@ -127,15 +132,15 @@ def summarize_report(report: dict, failed_only: bool = False) -> dict:
                 continue
             if iteration.get("errorMessage"):
                 row["errorMessage"] = iteration["errorMessage"]
-            for step in iteration.get("testStepResults") or iteration.get("stepResults") or []:
+            for step in iteration.get("stepResults") or iteration.get("testStepResults") or []:
                 if not isinstance(step, dict):
                     continue
-                step_status = str(step.get("status") or "").upper()
-                if step_status and step_status not in ("PASSED", "PASS", "SUCCESS"):
+                step_status = str(step.get("resultStatus") or step.get("status") or "").upper()
+                if step_status and step_status not in ("PASSED", "PASS", "SUCCESS", "SKIPPED"):
                     row["firstFailedStep"] = {
                         "sequence": step.get("sequence"),
                         "title": step.get("testStepName") or step.get("testStepTitle"),
-                        "status": step.get("status"),
+                        "status": step.get("resultStatus") or step.get("status"),
                         "statusMessage": step.get("statusMessage"),
                     }
                     break

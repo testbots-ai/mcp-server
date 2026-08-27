@@ -16,38 +16,64 @@ from src.tools.script_identity import describe_credentials
 # --- video / screenshot in the report summary --------------------------------------------------
 
 def _report(iterations, grid_info=None):
-    script = {"name": "Login Module", "status": "FAILED", "iterations": iterations}
+    """
+    Shaped from a REAL detailed-results payload (execution fd49b18e), not from the field names
+    this module originally guessed. The first version of these tests used `status` and
+    `testStepResults`; the live API uses `resultStatus` and `stepResults`, so the tests passed
+    while the summary returned null statuses and no firstFailedStep against real data.
+    """
+    script = {"testScriptName": "Login Module", "resultStatus": "FAILED", "iterations": iterations}
     if grid_info is not None:
         script["gridInfo"] = grid_info
     return {"executionId": "e1", "status": "FAILED",
-            "testSuiteResults": [{"name": "Sanity", "testScriptResults": [script]}]}
+            "testSuiteResults": [{"testSuiteName": "Sanity", "testScriptResults": [script]}]}
 
 
 def test_summary_carries_the_video_and_screenshot_urls():
     report = _report([{
         "videoUrl": "https://cdn.example.com/run-1.mp4",
         "screenshotUrl": "https://cdn.example.com/step-4.png",
-        "testStepResults": [{"sequence": 4, "status": "FAILED", "statusMessage": "no such element"}],
+        "stepResults": [
+            {"sequence": 1, "resultStatus": "PASSED", "testStepName": "Open browser"},
+            {"sequence": 4, "resultStatus": "FAILED", "testStepName": "Click Sign In",
+             "statusMessage": "no such element"},
+            {"sequence": 5, "resultStatus": "SKIPPED", "testStepName": "Verify dashboard"},
+        ],
     }])
     row = summarize_report(report)["scripts"][0]
 
+    assert row["status"] == "FAILED", "script status must be read from resultStatus"
     assert row["videoUrl"] == "https://cdn.example.com/run-1.mp4"
     assert row["screenshotUrl"] == "https://cdn.example.com/step-4.png"
     assert row["firstFailedStep"]["sequence"] == 4
+    assert row["firstFailedStep"]["title"] == "Click Sign In"
+    assert "203" not in str(row)
+
+
+def test_a_skipped_step_is_not_reported_as_the_first_failure():
+    """SKIPPED means an earlier step already failed — reporting it as the failure points at the
+    wrong step. Real payloads carry SKIPPED for everything after the true failure."""
+    report = _report([{"stepResults": [
+        {"sequence": 1, "resultStatus": "FAILED", "testStepName": "Open browser",
+         "statusMessage": "[DEAD-SESSION] The browser session ended unexpectedly."},
+        {"sequence": 2, "resultStatus": "SKIPPED", "testStepName": "Enter email"},
+    ]}])
+    step = summarize_report(report)["scripts"][0]["firstFailedStep"]
+    assert step["sequence"] == 1 and "DEAD-SESSION" in step["statusMessage"]
 
 
 def test_a_browserstack_session_video_on_grid_info_is_used_as_a_fallback():
-    report = _report([{"testStepResults": []}], grid_info={"videoUrl": "https://bs.example.com/s.mp4"})
+    report = _report([{"stepResults": []}], grid_info={"videoUrl": "https://bs.example.com/s.mp4"})
     assert summarize_report(report)["scripts"][0]["videoUrl"] == "https://bs.example.com/s.mp4"
 
 
 def test_no_media_keys_when_the_run_recorded_none():
-    row = summarize_report(_report([{"testStepResults": []}]))["scripts"][0]
+    row = summarize_report(_report([{"stepResults": []}]))["scripts"][0]
     assert "videoUrl" not in row and "screenshotUrl" not in row
 
 
 def test_the_summary_note_points_at_the_recording():
-    assert "videoUrl" in summarize_report(_report([{"testStepResults": []}]))["note"]
+    assert "videoUrl" in summarize_report(_report([{"stepResults": []}]))["note"]
 
 
 # --- which account does the script sign in as? -------------------------------------------------
