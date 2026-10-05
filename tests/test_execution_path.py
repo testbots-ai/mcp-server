@@ -334,7 +334,7 @@ async def test_dispatch_schedule_bot_recurring_fills_in_omitted_defaults(monkeyp
     monkeypatch.setattr(DEFAULT_BUNDLE.test_mgmt, "create_scheduler", fake_create_scheduler)
 
     await _dispatch("schedule_bot_recurring", {
-        "bot_id": "b1", "name": "Nightly Run", "cron": "0 0 * * *",
+        "bot_id": "b1", "name": "Nightly Run", "cron": "0 0 * * *", "emails": [],
         "execution_configuration": _valid_exec_config(),
     }, DEFAULT_BUNDLE)
 
