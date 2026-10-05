@@ -9,6 +9,7 @@ from src.tools.url_guard import validate_public_http_url
 
 MAX_PAGES = 20
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
+LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
 
 
 def _dedup_key(url: str) -> str:
@@ -209,6 +210,20 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool) -> d
             auth = {"attempted": True, "succeeded": False, "detail": None, "final_url": None}
             login_page = await context.new_page()
             await login_page.goto(url, wait_until="networkidle", timeout=30_000)
+            # networkidle is not "the form has rendered": a client-rendered sign-in page (Next.js,
+            # React) mounts its form a beat after the network goes quiet, and on the slower hosted
+            # pod the capture below used to run in that gap — pages_crawled: 1, 0 locators, ok:true
+            # (live 2026-10-02 against dev.automationhq.ai/login, while a local run of the same
+            # call found all 9). The fill() calls further down never noticed because they auto-wait.
+            # Wait for the password field the same way, then give the rest of the form the settle
+            # time the normal crawl loop already gets. A page with no password field just costs the
+            # timeout and is captured as it is.
+            try:
+                await login_page.locator('input[type="password"]').first.wait_for(
+                    state="visible", timeout=LOGIN_FORM_RENDER_TIMEOUT)
+            except Exception:
+                pass
+            await login_page.wait_for_timeout(1_000)
             # Capture the sign-in form BEFORE submitting it. This is the only moment it exists in
             # this crawl: once the context holds a session, every later visit to the same URL
             # renders the authenticated app instead, so a credentialed crawl used to come back
