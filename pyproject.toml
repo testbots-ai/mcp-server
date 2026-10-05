@@ -11,7 +11,6 @@ dependencies = [
     "mcp>=1.0.0,<2.0.0",  # 2.0.0 (2026-07-31) dropped the @server.list_tools()/@server.call_tool() decorator API and lowlevel.server.request_ctx for a constructor-callback style — pin to 1.x until that migration is deliberately scoped
     "httpx>=0.27.0",
     "cryptography>=42.0",  # Fernet for hosted OAuth blobs; already in uv.lock via mcp->pyjwt[crypto], pinned explicitly since we import it directly
-
     "playwright>=1.61,<1.62",  # browser build is tied to the minor version - bump BOTH this and run `playwright install chromium` together
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
@@ -21,6 +20,7 @@ dependencies = [
     "openpyxl>=3.1.1",
     "uvicorn>=0.30.0",
     "starlette>=0.37.0",
+    "pymongo>=4.17.0",
 ]
 
 [project.optional-dependencies]
