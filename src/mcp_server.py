@@ -189,6 +189,88 @@ async def _preflight_execution_configuration(clients: ClientBundle, config: dict
     return None
 
 
+async def _bot_branch_problem(clients: ClientBundle, bot_id: str, branch: str, branch_named: bool):
+    """
+    Refuse a run or schedule whose TestBot has scripts that are not on the branch it will run.
+
+    A run with no targetBranchName runs main, and a script that lives only on a feature branch is
+    SKIPPED there while the run still reports green - it tested nothing and says it passed. The
+    model cannot see that coming, so the bot's scripts are checked against real branch membership
+    and the user is asked to pick a branch instead.
+
+    get_scripts_for_branch only returns scripts with branch records, so a script missing from the
+    target branch counts only if it IS on some other branch; one on no branch at all predates
+    branch tracking and runs from its live document anywhere. Fail-open, like
+    _preflight_execution_configuration: any lookup that errors lets the call through.
+    """
+    try:
+        bot = await clients.test_mgmt.get_bot(bot_id)
+        suites = [s for s in (bot.get("testSuites") or []) if isinstance(s, dict)]
+        suites = [s for s in suites if s.get("selected")] or suites
+        scripts = {}
+        for suite in suites:
+            if not suite.get("testSuiteId"):
+                continue
+            doc = await clients.test_mgmt.get_suite(suite["testSuiteId"])
+            for script in (doc or {}).get("testScripts") or []:
+                if isinstance(script, dict) and script.get("testScriptId"):
+                    scripts.setdefault(script["testScriptId"], script.get("name") or "Unnamed script")
+        if not scripts:
+            return None
+
+        branches = [b.get("branchName") for b in (await clients.test_mgmt.list_branches() or [])
+                    if isinstance(b, dict) and b.get("branchName")]
+        if "main" not in branches:
+            branches.insert(0, "main")
+        listings = await asyncio.gather(*(clients.test_mgmt.get_scripts_for_branch(b) for b in branches))
+        membership = {}
+        for name, listing in zip(branches, listings):
+            for item in listing or []:
+                if isinstance(item, dict) and item.get("testScriptId"):
+                    membership.setdefault(item["testScriptId"], set()).add(name)
+
+        missing = {script_name: sorted(membership[script_id])
+                   for script_id, script_name in scripts.items()
+                   if script_id in membership and branch not in membership[script_id]}
+        if not missing:
+            return None
+        holding = sorted(set.intersection(*(set(on) for on in missing.values())))
+        why = " (no targetBranchName was given, so it would run on main)" if not branch_named else ""
+        return {
+            "status": "NEEDS_BRANCH",
+            "error": (
+                f"{len(missing)} of this TestBot's scripts {'is' if len(missing) == 1 else 'are'} not on branch "
+                f"'{branch}'{why}, so the run would skip {'it' if len(missing) == 1 else 'them'} and still "
+                "report green. Ask the user which branch to run on - offer the names in `branches`, "
+                "suggesting one from `branchesWithAllScripts` - then call again with "
+                "execution_configuration.targetBranchName set to their choice."
+            ),
+            "scriptsNotOnBranch": [{"name": n, "onBranches": on} for n, on in missing.items()],
+            "branches": branches,
+            "branchesWithAllScripts": holding,
+        }
+    except Exception:  # noqa: BLE001 - fail-open: the check must never become the failure
+        return None
+
+
+async def _ask_for_recipients(clients: ClientBundle) -> dict:
+    """
+    A schedule's result emails are the user's choice, and one created with nobody on it runs
+    silently forever. Asked rather than defaulted: `emails` must be passed explicitly, with []
+    meaning "nobody", and the previously used addresses come back as suggestions.
+    """
+    try:
+        used = await clients.test_mgmt.list_scheduler_recipient_emails()
+    except Exception:  # noqa: BLE001 - suggestions are a convenience
+        used = []
+    return {
+        "status": "NEEDS_INPUT",
+        "error": ("Ask the user who should get this schedule's result emails before creating it, then "
+                  "call again with `emails` - pass [] if they want nobody emailed."),
+        "previouslyUsedEmails": used if isinstance(used, list) else [],
+    }
+
+
 def _fill_resolution_default(execution_configuration: dict, is_local: bool) -> dict:
     """
     "Local Machine Resolution" only means something for the local-agent grid ("use whatever
@@ -506,7 +588,8 @@ TOOLS = [
     Tool(name="list_test_scripts", description="List or search test scripts by name. Returns a summary per script (id, name, status, type, stepCount) — call get_test_script for a script's actual steps. The `name` filter is a plain case-insensitive substring match. Results cover the configured project only; use get_scripts_for_branch to ask which scripts are on a specific branch.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Optional case-insensitive substring filter"}}}),
     Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. A 60+ step script can exceed the result token cap: summary=true gives one line per step, steps_from/steps_to (inclusive, 1-based) one range in full. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that. Its versionCount is what the editing tools' expected_version takes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "summary": {"type": "boolean", "description": "Step titles only"}, "steps_from": {"type": "integer"}, "steps_to": {"type": "integer"}}, "required": ["script_id"]}),
     Tool(name="delete_test_script", description="Delete a test script. This is the SAME soft delete the UI performs — the script is archived (isArchived=true), appears under Administration -> Archive, and can be brought back with restore_asset; it is not destroyed. TWO-PHASE: if the script is still referenced by any Test Set or TestBot, the first call deletes NOTHING and returns status NEEDS_CONFIRMATION listing them (the raw API signals this with a 202 that is easily misread as success). Relay that list to the user and only call again with confirmed=true if they agree — that detaches the script from each one as it deletes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "confirmed": {"type": "boolean", "default": False, "description": "Set true ONLY to confirm a prior NEEDS_CONFIRMATION response, after the user has agreed"}}, "required": ["script_id"]}),
-    Tool(name="add_test_steps", description="Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
+    Tool(name="add_test_steps", description="Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate. Only inserts - to change a step use replace_test_step.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
+    Tool(name="replace_test_step", description="Replace the step at `sequence` (1-based) with `steps` - one or more, e.g. a wait then the corrected check. Use to fix or change a step; add_test_steps only inserts. Insert-then-remove, so a failure never loses the step. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequence": {"type": "integer"}, "steps": {"type": "array", "items": {"type": "object"}}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}, "expected_version": {"type": "integer"}}, "required": ["script_id", "sequence", "steps", "branch_name"]}),
     Tool(name="update_test_script", description="Update fields of an existing test script (name, status, story_id, testSteps, ...) — GET-merge-PUT, so unspecified fields are preserved. Pass branch_name for the same reason as add_test_steps. Same protected-branch caveat.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "changes": {"type": "object", "description": "Fields to change, using the entity's own field names (e.g. name, status, storyId, testSteps)"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "changes", "branch_name"]}),
     Tool(name="delete_test_steps", description="Remove steps by 1-based sequence and/or testStepId, renumbering the rest. Use this rather than rebuilding the whole testSteps array via update_test_script — resending every unrelated step to drop one is how unrelated steps get corrupted. All-or-nothing: nothing is deleted unless every sequence/id matches. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequences": {"type": "array", "items": {"type": "integer"}}, "step_ids": {"type": "array", "items": {"type": "string"}}, "branch_name": {"type": "string"}, "expected_version": {"type": "integer"}}, "required": ["script_id"]}),
     Tool(name="reorder_test_steps", description="Reorder steps. `order` is every step's CURRENT 1-based sequence in its new order, and must be a permutation of all of them — a partial list is refused, not guessed at.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "order": {"type": "array", "items": {"type": "integer"}}, "branch_name": {"type": "string"}, "expected_version": {"type": "integer"}}, "required": ["script_id", "order"]}),
@@ -673,9 +756,9 @@ TOOLS = [
     Tool(name="check_script_for_credential_exposure", description="Scan a script for plaintext credentials accidentally baked into step values. DETECTION ONLY — it tells you what's there, not a filter. Reports email addresses, passwords, tokens, API keys that may be exposed. Recommends vault secrets (type 7) as the fix: create_config_vault_secret + reference it instead of the literal value.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}}, "required": ["script_id"]}),
     Tool(name="execute_script_only", description="Run a SINGLE test script in isolation, WITHOUT creating a full suite/bot structure. The fast path for targeting a specific script when debugging — avoids 40-90min full regression cycles. Internally creates temporary suite+bot, runs the script, and returns cleanup instructions. REQUIRED: execution_configuration (same as execute_bot: baseUrl/browser/browserVersion/osType/gridId). confirm_script_id is a safety parameter — must equal script_id to proceed (prevents accidental wrong-script execution).", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "execution_configuration": {"type": "object", "description": "Browser/grid/environment config (same shape as execute_bot)", "properties": {"baseUrl": {"type": "string"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string"}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}, "confirm_script_id": {"type": "string", "description": "Must equal script_id — safety check to prevent accidental wrong-script execution"}}, "required": ["script_id", "execution_configuration", "confirm_script_id"]}),
 
-    Tool(name="schedule_bot_recurring", description="Create a recurring schedule for a TestBot — the real scheduler backing both the Scheduler Admin page and each TestBot's own clock-icon dialog (test-management-services). REQUIRED: name (1-120 chars, the schedule's own name — ask the user if not given), cron (a real cron expression — use convert_text_to_cron first if the user described it in plain language, e.g. 'every day at 9am'), execution_configuration (same shape as execute_bot's: baseUrl/browser/browserVersion/osType/gridId required). emails (result-recipient list) is optional but should be asked for — check list_scheduler_recipient_emails for previously-used addresses first.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "name": {"type": "string", "description": "The schedule's own name, 1-120 chars"}, "emails": {"type": "array", "items": {"type": "string"}, "description": "Result-notification recipients"}, "cron": {"type": "string", "description": "Cron expression, e.g. '0 9 * * *'. Use convert_text_to_cron to derive one from plain language."}, "execution_configuration": {"type": "object", "properties": {"baseUrl": {"type": "string", "description": "Environment ID (NOT a URL)"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string"}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}}, "required": ["bot_id", "name", "cron", "execution_configuration"]}),
+    Tool(name="schedule_bot_recurring", description="Create a recurring schedule for a TestBot — the real scheduler backing both the Scheduler Admin page and each TestBot's own clock-icon dialog (test-management-services). REQUIRED: name (1-120 chars, the schedule's own name — ask the user if not given), cron (a real cron expression — use convert_text_to_cron first if the user described it in plain language, e.g. 'every day at 9am'), execution_configuration (same shape as execute_bot's: baseUrl/browser/browserVersion/osType/gridId required). emails must be asked for ([] = nobody); list_scheduler_recipient_emails has past addresses. Scripts not on the run branch return NEEDS_BRANCH with branches to offer.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "name": {"type": "string", "description": "The schedule's own name, 1-120 chars"}, "emails": {"type": "array", "items": {"type": "string"}, "description": "Ask the user; [] = nobody. Omitted returns NEEDS_INPUT."}, "cron": {"type": "string", "description": "Cron expression, e.g. '0 9 * * *'. Use convert_text_to_cron to derive one from plain language."}, "execution_configuration": {"type": "object", "properties": {"baseUrl": {"type": "string", "description": "Environment ID (NOT a URL)"}, "browser": {"type": "string"}, "browserVersion": {"type": "string"}, "osType": {"type": "string"}, "gridId": {"type": "string"}, "targetBranchName": {"type": "string", "description": "Branch every run executes (default main)."}}, "required": ["baseUrl", "browser", "browserVersion", "osType", "gridId"]}}, "required": ["bot_id", "name", "cron", "execution_configuration"]}),
     Tool(name="cancel_schedule", description="Delete a recurring schedule created by schedule_bot_recurring (test-management-services' real scheduler).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}}, "required": ["schedule_id"]}),
-    Tool(name="update_schedule", description="Update an existing recurring schedule (name, emails, cron, and/or execution_configuration) — only supply the fields you want changed, everything else is preserved from the current schedule (fetched first, merged, then saved as a whole — the real endpoint has no partial-patch mode).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}, "bot_id": {"type": "string"}, "name": {"type": "string"}, "emails": {"type": "array", "items": {"type": "string"}}, "cron": {"type": "string"}, "execution_configuration": {"type": "object"}}, "required": ["schedule_id"]}),
+    Tool(name="update_schedule", description="Update an existing recurring schedule (name, emails, cron, and/or execution_configuration incl. targetBranchName) — only supply the fields you want changed, everything else is preserved from the current schedule (fetched first, merged, then saved as a whole — the real endpoint has no partial-patch mode).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}, "bot_id": {"type": "string"}, "name": {"type": "string"}, "emails": {"type": "array", "items": {"type": "string"}}, "cron": {"type": "string"}, "execution_configuration": {"type": "object"}}, "required": ["schedule_id"]}),
     Tool(name="toggle_schedule", description="Enable/disable a recurring schedule without deleting it (flips its current state).", inputSchema={"type": "object", "properties": {"schedule_id": {"type": "string"}}, "required": ["schedule_id"]}),
     Tool(name="list_schedulers", description="List recurring schedules (the same ones shown in Scheduler Admin). Pass bot_id to reproduce the exact filtered view a TestBot's own scheduler dialog shows — useful to confirm a schedule actually landed against the bot you expected.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string", "description": "Optional — filter to one TestBot's schedules"}, "offset": {"type": "integer", "default": 0}, "size": {"type": "integer", "default": 100}}}),
     Tool(name="list_scheduler_recipient_emails", description="Previously-used schedule result-notification email addresses, for suggesting values instead of guessing one.", inputSchema={"type": "object", "properties": {}}),
@@ -1210,6 +1293,39 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             expected_version=args.get("expected_version"))
         return _editver.annotate_edit(
             _locval.annotate(result, resolution), args.get("branch_name"))
+    if name == "replace_test_step":
+        # MCP has no step-edit primitive, so "change step 5" used to become add_test_steps at
+        # position 4: a corrected step 5 above the old one, which then ran as step 6 and failed
+        # the run on its own. Insert first, then remove the old step, so a failure in between
+        # leaves both steps (recoverable, and the error says which) rather than neither.
+        steps = args.get("steps") or []
+        sequence = int(args.get("sequence") or 0)
+        if sequence < 1 or not steps:
+            return {"error": "replace_test_step needs a 1-based `sequence` and at least one step in `steps`."}
+        resolution = await _resolve_locators_for_script(clients, args["script_id"], steps)
+        if resolution["unresolved"]:
+            return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        added = await clients.test_mgmt.add_test_steps(
+            args["script_id"], steps, sequence - 1,
+            branch_name=args.get("branch_name"),
+            expected_version=args.get("expected_version"))
+        if isinstance(added, dict) and added.get("error"):
+            return {"error": f"Nothing was changed - the new step could not be added: {added['error']}"}
+        old_position = sequence + len(steps)
+        try:
+            removed = await clients.test_mgmt.delete_test_steps(
+                args["script_id"], sequences=[old_position], branch_name=args.get("branch_name"))
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            removed = {"error": str(exc)}
+        if isinstance(removed, dict) and removed.get("error"):
+            return {"error": (f"The new step was added as step {sequence}, but the old step (now step "
+                              f"{old_position}) could not be removed: {removed['error']}. Remove it with "
+                              f"delete_test_steps(sequences=[{old_position}]).")}
+        result = {"message": f"Step {sequence} replaced with {len(steps)} step(s)",
+                  "replaced": sequence, "stepsAdded": len(steps)}
+        if isinstance(removed, dict) and removed.get("branchName"):
+            result["branchName"] = removed["branchName"]
+        return _editver.annotate_edit(_locval.annotate(result, resolution), args.get("branch_name"))
     if name == "delete_test_steps":
         return _editver.annotate_edit(await clients.test_mgmt.delete_test_steps(
             args["script_id"],
@@ -1538,6 +1654,11 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         preflight = await _preflight_execution_configuration(clients, execution_configuration)
         if preflight:
             return preflight
+        named_branch = (args["execution_configuration"].get("targetBranchName") or "").strip()
+        branch_problem = await _bot_branch_problem(
+            clients, args["bot_id"], named_branch or "main", bool(named_branch))
+        if branch_problem:
+            return branch_problem
         # A run tests the last COMMITTED version, so an uncommitted edit is silently absent from
         # it. Advisory, never blocking — the run still goes ahead and the warning rides with it.
         stale_scripts = await _editver.uncommitted_scripts_on(
@@ -1613,12 +1734,19 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         # equivalent one-time endpoint reports success and shows a PENDING job that never
         # actually runs, and disappears from status lookup). Same defaulting fix as execute_bot
         # for the nested execution_configuration (see its comment).
+        if "emails" not in args:
+            return await _ask_for_recipients(clients)
         execution_configuration = RunExecutionConfiguration(**args["execution_configuration"]).model_dump(exclude_none=True)
         # Worth even more here than on execute_bot: a schedule with a dead grid/environment id
         # fails on its own, unattended, every time it fires.
         preflight = await _preflight_execution_configuration(clients, execution_configuration)
         if preflight:
             return preflight
+        named_branch = (args["execution_configuration"].get("targetBranchName") or "").strip()
+        branch_problem = await _bot_branch_problem(
+            clients, args["bot_id"], named_branch or "main", bool(named_branch))
+        if branch_problem:
+            return branch_problem
         execution_configuration = await _fill_custom_properties(clients, execution_configuration)
         execution_configuration = _fill_resolution_default(
             execution_configuration, await _is_local_grid(clients, execution_configuration["gridId"]))

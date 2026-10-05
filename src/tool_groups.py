@@ -52,6 +52,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "get_test_script",
         "delete_test_script",
         "add_test_steps",
+        "replace_test_step",
         "update_test_script",
         "delete_test_steps",
         "reorder_test_steps",
