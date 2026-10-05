@@ -8,6 +8,20 @@ from src.tools.browser_setup import ensure_chromium, is_missing_browser_error
 from src.tools.url_guard import validate_public_http_url
 
 MAX_PAGES = 20
+# Ceiling on what a caller may ask for. A hosted crawl holds a headless Chromium for its whole run,
+# so the page count is bounded even when the caller wants a whole app.
+MAX_PAGES_LIMIT = 50
+# Collapsed menu groups and flyouts opened per page before capture. An app's whole navigation is
+# rarely more than a few dozen groups; the bound stops a page full of accordions running forever.
+MAX_MENU_EXPANSIONS = 40
+# Visible text longer than this is content, not a label - not a usable locator.
+MAX_LOCATOR_TEXT = 60
+# Collapsed navigation that hides its items until opened: antd/rc-menu submenus, ARIA menus and
+# disclosure buttons, inside the page's navigation only - never a form's dropdown.
+COLLAPSED_MENU_SELECTOR = ", ".join(
+    f"{scope} [aria-expanded=\"false\"]:not([data-crawl-expanded])"
+    for scope in ("nav", "aside", "[role=\"navigation\"]", "[role=\"menu\"]", "[role=\"menubar\"]", ".ant-menu")
+)
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
 LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
 
@@ -27,7 +41,7 @@ _CRAWL_SEMAPHORE = asyncio.Semaphore(max(1, settings.ahq_mcp_crawl_concurrency))
 
 
 async def _extract_locators(page: Page) -> list[dict]:
-    return await page.evaluate("""() => {
+    return await page.evaluate("""(MAX_TEXT) => {
         const elements = [];
         const interactable = document.querySelectorAll(
             'a, button, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [onclick]'
@@ -49,6 +63,9 @@ async def _extract_locators(page: Page) -> list[dict]:
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
 
+            // Set only below, when nothing on the element is meant to identify it - the case where
+            // its visible text is the most stable handle it has.
+            let stable = true;
             let css = null;
             if (el.id) {
                 css = `#${el.id}`;
@@ -61,6 +78,7 @@ async def _extract_locators(page: Page) -> list[dict]:
             } else if (el.getAttribute('placeholder')) {
                 css = el.tagName.toLowerCase() + '[placeholder="' + el.getAttribute('placeholder') + '"]';
             } else {
+                stable = false;
                 // Every class goes through CSS.escape. A Tailwind arbitrary value such as
                 // mt-[0.5px] is not merely unmatched when left raw - the bracket opens an
                 // attribute selector, so the whole query throws InvalidSelectorException and
@@ -72,8 +90,21 @@ async def _extract_locators(page: Page) -> list[dict]:
                 css = el.tagName.toLowerCase() + (classes.length ? '.' + classes.join('.') : '');
             }
 
+            // A sidebar item has no id, test id or label - only its text. A class chain is shared
+            // by every item in the menu and a positional XPath breaks when one is added, so the
+            // label is the locator: //a[normalize-space(.)='Test Scripts'].
+            let textXpath = null;
+            const label = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (!stable && label && label.length <= MAX_TEXT) {
+                const literal = label.indexOf("'") === -1 ? "'" + label + "'"
+                    : label.indexOf('"') === -1 ? '"' + label + '"'
+                    : "concat('" + label.split("'").join(`', "'", '`) + "')";
+                textXpath = '//' + el.tagName.toLowerCase() + '[normalize-space(.)=' + literal + ']';
+            }
+
             elements.push({
                 tag: el.tagName.toLowerCase(),
+                textXpath: textXpath,
                 type: el.getAttribute('type') || null,
                 // innerText is what the user SEES, after CSS. textContent is what a text-based
                 // locator has to match. They differ whenever text-transform is in play — an
@@ -96,7 +127,7 @@ async def _extract_locators(page: Page) -> list[dict]:
             });
         });
         return elements;
-    }""")
+    }""", MAX_LOCATOR_TEXT)
 
 
 async def _count_matches(page: Page, selector: str, *, is_xpath: bool = False) -> int:
@@ -122,7 +153,20 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
             await _count_matches(page, loc["xpath"], is_xpath=True) if loc.get("xpath") else 0
         )
 
-        if css_hits == 1:
+        text_hits = (
+            await _count_matches(page, loc["textXpath"], is_xpath=True) if loc.get("textXpath") else 0
+        )
+        text_xpath = loc.pop("textXpath", None)
+        if text_hits == 1:
+            # The label beats both a class chain and a position: it survives the menu being
+            # reordered or grown, and it reads as what the step clicks.
+            loc["positionalXpath"] = loc.get("xpath")
+            loc["xpath"] = text_xpath
+            xpath_hits = 1
+            loc["preferred"] = "xpath"
+            if css_hits == 1:
+                css_hits = 0  # a unique class chain is still a class chain; keep it as a fallback
+        elif css_hits == 1:
             loc["preferred"] = "css"
         elif xpath_hits == 1:
             loc["preferred"] = "xpath"
@@ -139,7 +183,8 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
 
 
 async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAGES,
-                    hosted: bool = False) -> dict:
+                    hosted: bool = False, follow_links: bool = True) -> dict:
+    max_pages = max(1, min(int(max_pages or MAX_PAGES), MAX_PAGES_LIMIT))
     if hosted:
         # SSRF guard (Slice 9j): a hosted crawl runs INSIDE the cluster, so a crafted URL
         # (or a same-domain link found while crawling) must never reach private/metadata
@@ -151,7 +196,7 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
             return {"error": blocked}
 
     async with _CRAWL_SEMAPHORE:
-        return await _crawl(url, credentials, max_pages, hosted)
+        return await _crawl(url, credentials, max_pages, hosted, follow_links)
 
 
 async def _capture_page(page, final_url: str = None) -> dict:
@@ -163,6 +208,10 @@ async def _capture_page(page, final_url: str = None) -> dict:
     """
     locators = await _extract_locators(page)
     valid_locators = await _validate_locators(page, locators)
+    seen = {(loc.get("xpath"), loc.get("text")) for loc in locators}
+    revealed, opened = await _expand_navigation(page, seen)
+    locators += revealed["all"]
+    valid_locators += revealed["valid"]
     total, valid = len(locators), len(valid_locators)
     resolution_rate = round(valid / total, 2) if total > 0 else 0.0
     return {
@@ -173,10 +222,60 @@ async def _capture_page(page, final_url: str = None) -> dict:
         "total_valid": valid,
         "resolution_rate": resolution_rate,
         "passes_threshold": resolution_rate >= 0.80,
+        "menus_expanded": opened,
     }
 
 
-async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool) -> dict:
+async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
+    """
+    Open every collapsed menu group and flyout in the page's navigation, one at a time,
+    capturing what each reveals.
+
+    A collapsed antd submenu renders its items at zero size and a flyout mounts its items only
+    once opened, so a capture of the page as loaded misses most of a sidebar - every module under
+    a closed group. Each batch is validated straight after its click: a flyout closes when the
+    next one opens, so validating at the end would find its items gone. A click that navigates
+    instead of expanding is undone, so the capture stays on the page it describes.
+    """
+    revealed = {"all": [], "valid": []}
+    opened = 0
+    start_url = page.url
+    for _ in range(MAX_MENU_EXPANSIONS):
+        # A handle, not a locator: a locator re-resolves on every use, so once this element is
+        # marked it would quietly point at the NEXT collapsed menu and click that one instead.
+        try:
+            trigger = await page.query_selector(COLLAPSED_MENU_SELECTOR)
+        except Exception:
+            # A page that cannot be queried still gets the capture it already has.
+            break
+        if trigger is None:
+            break
+        try:
+            await trigger.evaluate("el => el.setAttribute('data-crawl-expanded', 'true')")
+            if not await trigger.is_visible():
+                continue
+            await trigger.click(timeout=3_000)
+            await page.wait_for_timeout(400)
+        except Exception:
+            continue
+        if page.url != start_url:
+            try:
+                await page.go_back(wait_until="domcontentloaded")
+                await page.wait_for_timeout(500)
+            except Exception:
+                break
+            continue
+        opened += 1
+        fresh = [loc for loc in await _extract_locators(page)
+                 if (loc.get("xpath"), loc.get("text")) not in seen]
+        for loc in fresh:
+            seen.add((loc.get("xpath"), loc.get("text")))
+        revealed["all"] += fresh
+        revealed["valid"] += await _validate_locators(page, fresh)
+    return revealed, opened
+
+
+async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True) -> dict:
     base_domain = urlparse(url).netloc
     visited: set[str] = set()
     pages_data = []
@@ -338,7 +437,9 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool) -> d
 
                 pages_data.append(await _capture_page(page, final_url))
 
-                links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+                # follow_links=False captures the landing page only - enough for a test of its own
+                # menus, without spending a browser on every page they lead to.
+                links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)") if follow_links else []
                 for link in links:
                     parsed = urlparse(link)
                     if (

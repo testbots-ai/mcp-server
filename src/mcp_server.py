@@ -771,7 +771,7 @@ TOOLS = [
     Tool(name="get_performance_report", description="Duration and ROI/time-saved metrics for an ordinary UI execution, by execution_id. Pass/fail detail is get_execution_report on the same id. Unrelated to get_performance_results, which polls a JMeter load test.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
 
     # Application context
-    Tool(name="crawl_url", description="Crawl a live web application and capture real locators (XPath, CSS, aria-label) for test script generation. Run this whenever a test step needs a ui-locator for a page you haven't already captured locators for — never write a step against a hand-guessed selector (e.g. \"input[type='email']\") instead of calling this first.", inputSchema={"type": "object", "properties": {"url": {"type": "string"}, "credentials": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}, "max_pages": {"type": "integer", "default": 20}}, "required": ["url"]}),
+    Tool(name="crawl_url", description="Crawl a live web application and capture real locators (XPath, CSS, aria-label) for test script generation. Opens collapsed menus and flyouts so every navigation item is captured; label-only elements get text XPaths. Run this whenever a test step needs a ui-locator for a page you haven't already captured locators for — never write a step against a hand-guessed selector (e.g. \"input[type='email']\") instead of calling this first.", inputSchema={"type": "object", "properties": {"url": {"type": "string"}, "credentials": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}, "max_pages": {"type": "integer", "default": 20, "description": "Up to 50"}, "follow_links": {"type": "boolean", "default": True, "description": "false: capture only the landing page and its menus"}}, "required": ["url"]}),
     Tool(
         name="extract_requirements",
         description=(
@@ -1824,11 +1824,15 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
 
     # Application context
     if name == "crawl_url":
+        crawl_args = {}
+        if "follow_links" in args:
+            crawl_args["follow_links"] = bool(args["follow_links"])
         return await _crawl_url(
             url=args["url"],
             credentials=args.get("credentials"),
             max_pages=args.get("max_pages", 20),
             hosted=is_hosted,
+            **crawl_args,
         )
     if name == "extract_requirements":
         return _extract_requirements(args["file_path"])
