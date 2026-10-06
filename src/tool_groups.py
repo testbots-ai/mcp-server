@@ -233,6 +233,8 @@ _CORE_EXTRA = (
     "list_common_functions",
     "get_common_function",
     "extract_requirements",
+    # Secret names only - never a value - so a password step can point at a vault secret.
+    "list_config_vault_secrets",
     # execution — run a bot and watch it. Omits the local-agent probes, which are a
     # stdio-only troubleshooting path.
     "list_bots",
