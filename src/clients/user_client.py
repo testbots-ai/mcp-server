@@ -134,3 +134,30 @@ class UserClient(BaseAhqClient):
                 "expiryMinutes": str(expiry_minutes),
             },
         )
+
+    async def user_token_status(self, user_id: str) -> dict:
+        """The signed-in person's own personal-token count: `activeTokenCount` and `remainingTokens`.
+
+        Counted by owner only - other people's tokens in the organization never use these slots.
+        """
+        return await self.get("/rest/api/tokens/generate/user/tokenview", extra_headers={"userId": user_id})
+
+    async def create_user_token(self, user_id: str, base_url: str,
+                                label: str = "", expiry_minutes: int = 525600) -> dict:
+        """Mint a long-lived personal (USER) API token for the signed-in person.
+
+        The fallback when the organization is at its token limit: the per-user limit is separate,
+        so a person can still connect when the organization's slots are all taken. The gateway
+        accepts it exactly like an organization token (it only checks the value exists), and its
+        claims carry the same `organizationId` and `urlDetails` the MCP server reads - plus the
+        person's own `userId`, so work it does is attributed to them rather than to the org.
+        Same `urlDetails` rule and one-year default expiry as create_org_token.
+        """
+        return await self.post(
+            "/rest/api/tokens/generate/user",
+            json={"username": label, "urlDetails": [{"key": "baseUrl", "value": base_url}]},
+            extra_headers={
+                "userId": user_id,
+                "expiryMinutes": str(expiry_minutes),
+            },
+        )

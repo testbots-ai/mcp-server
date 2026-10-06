@@ -113,7 +113,7 @@ def test_env_prod_signs_in_to_prods_gateway_not_the_configured_one(monkeypatch):
     seen = {}
     monkeypatch.setattr(login.sys, "argv", ["testbots-login", "--env=prod"])
 
-    async def fake_run(base_url, force, profile=""):
+    async def fake_run(base_url, force, profile="", org_token=False):
         seen.update(base_url=base_url, profile=profile)
         return 0
 
@@ -186,7 +186,7 @@ def test_login_explains_the_token_cap_instead_of_raising_the_api_error(monkeypat
     monkeypatch.setattr(login.getpass, "getpass", lambda *a: "pw")
     monkeypatch.setattr(login, "ENV_PATH", login.Path("nonexistent-for-this-test.env"))
 
-    assert asyncio.run(login._run("https://gw.example", force=True)) == 1
+    assert asyncio.run(login._run("https://gw.example", force=True, org_token=True)) == 1
     out = capsys.readouterr().out
     assert "reached its limit" in out
     assert "Administration" in out

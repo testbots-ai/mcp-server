@@ -8,8 +8,14 @@ is strictly worse than a token, which is revocable, scoped, and cannot change th
 password or open the web UI.
 
 So this keeps the interactive part and drops the storage: prompt for the password, exchange it
-for a sign-in JWT, use that JWT once to mint an ORGANIZATION token, write only the token. The
-password is never written anywhere and is not held after the first call.
+for a sign-in JWT, use that JWT once to mint an API token, write only the token. The password is
+never written anywhere and is not held after the first call.
+
+The token is a personal (USER) one by default. Organization tokens share one limit of 5 across
+everyone in the organization, so a person who had created a single token was refused because
+colleagues held the other four. Personal tokens are limited per person, so the check is against
+the signer's own list - the one they see under API Tokens. `--org-token` still mints an
+organization token for whoever wants one.
 """
 import asyncio
 import datetime
@@ -39,6 +45,7 @@ _USAGE = """testbots-login - sign in and store an API token.
   testbots-login --use=prod          switch profiles without signing in again
   testbots-login --base-url=URL      a gateway not covered by a named profile
   testbots-login --force             mint another token even if one is already stored
+  testbots-login --org-token         mint an organization token instead of a personal one
 """
 
 # Above this, the picker asks for a filter first. Chosen to fit a default terminal without
@@ -144,7 +151,7 @@ def _choose(projects: list) -> dict:
         print("Not one of the options.")
 
 
-async def _run(base_url: str, force: bool, profile: str = "") -> int:
+async def _run(base_url: str, force: bool, profile: str = "", org_token: bool = False) -> int:
     env_path = _env_path(profile)
     if env_path.exists() and "TESTBOTS_API_TOKEN=" in env_path.read_text(encoding="utf-8") \
             and not force:
@@ -227,19 +234,39 @@ async def _run(base_url: str, force: bool, profile: str = "") -> int:
         project = _choose(projects)
 
         label = f"testbots-mcp-server ({os.environ.get('COMPUTERNAME') or os.uname().nodename})"
-        try:
-            result = await client(org_id).create_org_token(org_id, user_id, base_url, label=label)
-        except AhqApiError as exc:
-            # The cap is the single most likely failure here -- it is per-organization, low (5),
-            # and nothing revokes on replace, so any established org sits at it. Raising the raw
-            # API error buries a precise instruction under a stack-trace-shaped line.
-            if "token limit" not in str(exc).lower():
-                raise
-            print(f"\n{org_id} has reached its limit of active API tokens, so a new one "
-                  f"cannot be issued.\n\nDelete one you no longer use in the web app under "
-                  f"Administration -> Settings -> API Tokens,\nthen run this again. Nothing "
-                  f"has been changed and your existing tokens still work.")
-            return 1
+        if org_token:
+            try:
+                result = await client(org_id).create_org_token(org_id, user_id, base_url, label=label)
+            except AhqApiError as exc:
+                # Per organization, low (5), shared by every member and never revoked on replace,
+                # so an established org is usually at it. A personal token is the way through.
+                if "token limit" not in str(exc).lower():
+                    raise
+                print(f"\n{org_id} has reached its limit of active organization API tokens - that\n"
+                      f"limit is shared by everyone in the organization.\n\nRun this again without "
+                      f"--org-token to get a personal token instead, or delete an\norganization token "
+                      f"under Administration -> Settings -> API Tokens.")
+                return 1
+        else:
+            # Checked against the signer's own tokens first, so a full list is reported plainly
+            # rather than as a failed request - and other people's tokens never count here.
+            status = await client(org_id).user_token_status(user_id)
+            active = int(status.get("activeTokenCount") or 0)
+            remaining = status.get("remainingTokens")
+            if remaining is not None and int(remaining) <= 0:
+                print(f"\nYou already have {active} active personal API tokens, which is the limit "
+                      f"for one person.\n\nDelete one you no longer use in the web app under "
+                      f"Administration -> Settings -> API Tokens,\nthen run this again. Nothing has "
+                      f"been changed and your existing tokens still work.")
+                return 1
+            try:
+                result = await client(org_id).create_user_token(user_id, base_url, label=label)
+            except AhqApiError as exc:
+                if "token limit" not in str(exc).lower():
+                    raise
+                print("\nYou have reached the limit of active personal API tokens.\n\nDelete one "
+                      "under Administration -> Settings -> API Tokens, then run this again.")
+                return 1
 
     token = result.get("token") or ""
     if not token:
@@ -252,7 +279,7 @@ async def _run(base_url: str, force: bool, profile: str = "") -> int:
     # and expiry are only decided server-side, so this is the one thing that confirms what was
     # actually issued -- and the org UUID alone tells nobody which organization they landed in.
     claims = decode_ahq_token(token)
-    org_name = claims.get("organizationName") or org_id
+    org_name = claims.get("organizationName") or me.get("organizationName") or org_id
     person = " ".join(p for p in (me.get("firstName"), me.get("lastName")) if p).strip()
     expires = claims.get("exp")
     expiry = f" (expires {datetime.date.fromtimestamp(expires)})" if expires else ""
@@ -264,10 +291,13 @@ async def _run(base_url: str, force: bool, profile: str = "") -> int:
         print(f"  gateway       {base_url}")
     print(f"  organization  {org_name}")
     print(f"  project       {project['name']}")
-    print(f"  API token     created{expiry}")
+    kind = "organization" if org_token else "personal"
+    print(f"  API token     {kind} token created{expiry}")
     print(f"  saved to      {env_path}")
     if (remaining := result.get("remainingTokens")) is not None:
-        print(f"\n{remaining} token slot(s) left in this organization.")
+        left = int(remaining)
+        owner = "this organization" if org_token else "your account"
+        print(f"\n{left} {'token slot' if left == 1 else 'token slots'} left on {owner}.")
     if profile:
         # Writing the credentials is not the same as selecting them: a profile file is inert
         # until something names it. Switching silently here is exactly the prod/dev mix-up this
@@ -296,6 +326,7 @@ def main() -> int:
         return _activate(profile)
 
     force = "--force" in args
+    org_token = "--org-token" in args
     profile = _clean_profile(_arg(args, "--env"))
     if _arg(args, "--env") and not profile:
         print(f"{_arg(args, '--env')!r} is not a usable profile name.")
@@ -314,7 +345,7 @@ def main() -> int:
               f"or use one of: {', '.join(PROFILE_BASE_URLS)}")
         return 1
     try:
-        return asyncio.run(_run(base_url, force, profile))
+        return asyncio.run(_run(base_url, force, profile, org_token))
     except KeyboardInterrupt:
         print("\nCancelled.")
         return 130
