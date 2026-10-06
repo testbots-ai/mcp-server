@@ -37,6 +37,7 @@ from src.tools.script_identity import describe_credentials as _describe_credenti
 from src.tools import edit_verification as _editver
 from src.tools import password_steps as _pwsteps
 from src.tools import wait_steps as _waitsteps
+from src.tools import template_platform as _platform
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -655,7 +656,7 @@ TOOLS = [
 
     # Step templates — resolve real templateIds before writing any test step
     Tool(name="list_step_templates", description="List available step templates (built-in action types + org-defined Common Functions) for the current project. Use this or search_step_templates before writing any test step — templateId is never invented.", inputSchema={"type": "object", "properties": {"offset": {"type": "integer", "default": 0}}}),
-    Tool(name="search_step_templates", description="Search step templates by title (e.g. 'Click', 'Navigate', 'Assert Text') to find the real templateId for an action. Matching is a substring search over the platform's own titles, which often differ from the obvious word — common synonyms are expanded automatically (searching 'Navigate' also returns 'Open Web Browser and go to page', 'assert' also returns the 'Verify ...' family), so search by intent rather than guessing the platform's phrasing.", inputSchema={"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}),
+    Tool(name="search_step_templates", description="Search step templates by title (e.g. 'Click', 'Navigate', 'Assert Text') to find the real templateId for an action. Matching is a substring search over the platform's own titles, which often differ from the obvious word — common synonyms are expanded automatically (searching 'Navigate' also returns 'Open Web Browser and go to page', 'assert' also returns the 'Verify ...' family), so search by intent rather than guessing the platform's phrasing. Pass the script's script_type (WEB, MOBILE, DESKTOP) to get only templates that run on it.", inputSchema={"type": "object", "properties": {"title": {"type": "string"}, "script_type": {"type": "string", "enum": ["WEB", "MOBILE", "DESKTOP"]}}, "required": ["title"]}),
     Tool(name="get_step_template", description="Get full detail of a step template by ID, including which params sub-fields it expects.", inputSchema={"type": "object", "properties": {"template_id": {"type": "string"}}, "required": ["template_id"]}),
 
     # Recorded Scripts — browser sessions captured by the TestBot Recorder Chrome Extension.
@@ -1040,14 +1041,18 @@ async def _resolve_locators_for_script(clients, script_id: str, steps) -> dict:
     surface that error on its own terms a moment later, and a lookup must never become the failure.
     """
     website_id = None
+    script_type = None
     try:
         script = await clients.test_mgmt.get_test_script(script_id)
         if isinstance(script, dict):
             website_id = script.get("websiteId")
+            script_type = script.get("type")
     except Exception:
         pass
     resolution = await _locval.resolve_step_locators(clients, website_id, steps)
     resolution["website_id"] = website_id
+    # The platform check reads the script's type from the same fetch; None leaves it unchecked.
+    resolution["platform"] = _platform.platform_of(script_type) if script_type else None
     return resolution
 
 
@@ -1289,6 +1294,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         resolution = await _resolve_locators_for_script(clients, args["script_id"], args["steps"])
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        wrong_platform = await _platform.mismatches(clients, args["steps"], resolution["platform"])
+        if wrong_platform:
+            return _platform.refusal(wrong_platform, resolution["platform"])
         result = await clients.test_mgmt.add_test_steps(
             args["script_id"], args["steps"], args.get("position"),
             branch_name=args.get("branch_name"),
@@ -1308,6 +1316,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         resolution = await _resolve_locators_for_script(clients, args["script_id"], steps)
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        wrong_platform = await _platform.mismatches(clients, steps, resolution["platform"])
+        if wrong_platform:
+            return _platform.refusal(wrong_platform, resolution["platform"])
         added = await clients.test_mgmt.add_test_steps(
             args["script_id"], steps, sequence - 1,
             branch_name=args.get("branch_name"),
@@ -1353,6 +1364,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
                 clients, args["script_id"], changes["testSteps"])
             if resolution["unresolved"]:
                 return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+            platform = _platform.platform_of(changes.get("type")) if changes.get("type") else resolution["platform"]
+            wrong_platform = await _platform.mismatches(clients, changes["testSteps"], platform)
+            if wrong_platform:
+                return _platform.refusal(wrong_platform, platform)
         result = await clients.test_mgmt.update_test_script(
             args["script_id"], branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"), **changes)
@@ -1396,6 +1411,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         resolution["website_id"] = args.get("website_id")
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
+        platform = _platform.platform_of(args.get("script_type"))
+        wrong_platform = await _platform.mismatches(clients, args.get("steps"), platform)
+        if wrong_platform:
+            return _platform.refusal(wrong_platform, platform)
         result = await clients.test_mgmt.create_test_script(
             args["name"], args["steps"], args.get("page_id"), args.get("website_id"), args.get("story_id"), **kwargs
         )
@@ -1406,7 +1425,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "list_step_templates":
         return await clients.test_mgmt.list_templates(args.get("offset", 0))
     if name == "search_step_templates":
-        return await clients.test_mgmt.search_templates(args["title"])
+        templates = await clients.test_mgmt.search_templates(args["title"])
+        if args.get("script_type"):
+            return _platform.filter_templates(templates, _platform.platform_of(args["script_type"]))
+        return templates
     if name == "get_step_template":
         return await clients.test_mgmt.get_template(args["template_id"])
 
