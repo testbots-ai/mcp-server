@@ -191,10 +191,15 @@ one), ground the test cases in the real app instead of the document's wording al
 - **After the step that submits a login, the wait is always 10 seconds** (`template-id-35` with 10,
   or `template-id-36` on a signed-in page element with 10) - many apps take that long to load
   after signing in, and a shorter wait fails the first check on a slow day.
-- **A login step needs the real password or a vault secret** (`{"vault": "<secret name>"}`). If the
-  user has given neither, type `UPDATE_PASSWORD` in the password step and tell them plainly that the
-  password must be updated before the script runs - never a made-up variable, a phrase like "the
-  password you gave", or a row of dots. The script-writing tools return `password_warning` when a
+- **Type a password with "Enter encrypted-text {{text}} for {{ui-locator}}" (`template-id-98`)**,
+  never the plain Enter step, so it is stored encrypted. Its value is a vault secret
+  (`{"vault": "<secret name>"}`, from `list_config_vault_secrets`) when the user names one or one
+  clearly fits, otherwise the password the user gave. If there is neither, type `UPDATE_PASSWORD`
+  and tell them plainly that the password must be updated before the script runs - never a
+  made-up variable, a phrase like "the password you gave", or a row of dots.
+- **Copy each step's `templateId` and `templateTitle` exactly as the search returned them, as a
+  pair.** A step runs by its templateId whatever its title says; a mismatched pair is corrected to
+  the template that has the title, or refused. The script-writing tools return `password_warning` when a
   password step has no real password: always pass it on to the user.
 - **Check text exactly as `crawl_url` captured it**, not as the user worded it. Icons (+, ×,
   arrows) are not text: a button showing "+ New Test Bot" has the text "New Test Bot", and a check

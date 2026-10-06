@@ -1294,7 +1294,7 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         resolution = await _resolve_locators_for_script(clients, args["script_id"], args["steps"])
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
-        wrong_platform = await _platform.mismatches(clients, args["steps"], resolution["platform"])
+        wrong_platform = await _platform.mismatches(clients, args["steps"], resolution["platform"], resolution)
         if wrong_platform:
             return _platform.refusal(wrong_platform, resolution["platform"])
         result = await clients.test_mgmt.add_test_steps(
@@ -1316,7 +1316,7 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         resolution = await _resolve_locators_for_script(clients, args["script_id"], steps)
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
-        wrong_platform = await _platform.mismatches(clients, steps, resolution["platform"])
+        wrong_platform = await _platform.mismatches(clients, steps, resolution["platform"], resolution)
         if wrong_platform:
             return _platform.refusal(wrong_platform, resolution["platform"])
         added = await clients.test_mgmt.add_test_steps(
@@ -1365,7 +1365,7 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             if resolution["unresolved"]:
                 return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
             platform = _platform.platform_of(changes.get("type")) if changes.get("type") else resolution["platform"]
-            wrong_platform = await _platform.mismatches(clients, changes["testSteps"], platform)
+            wrong_platform = await _platform.mismatches(clients, changes["testSteps"], platform, resolution)
             if wrong_platform:
                 return _platform.refusal(wrong_platform, platform)
         result = await clients.test_mgmt.update_test_script(
@@ -1412,7 +1412,7 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         if resolution["unresolved"]:
             return _locval.refusal_for(resolution["unresolved"], resolution["website_id"])
         platform = _platform.platform_of(args.get("script_type"))
-        wrong_platform = await _platform.mismatches(clients, args.get("steps"), platform)
+        wrong_platform = await _platform.mismatches(clients, args.get("steps"), platform, resolution)
         if wrong_platform:
             return _platform.refusal(wrong_platform, platform)
         result = await clients.test_mgmt.create_test_script(
