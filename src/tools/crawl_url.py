@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page
@@ -24,6 +25,99 @@ COLLAPSED_MENU_SELECTOR = ", ".join(
 )
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
 LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
+
+# Marks the sign-in form for the locators below. A password field counts only when an email or
+# username field sits with it - in its <form>, or within a few enclosing elements when there is no
+# form. A lone password-type box is something else: an API page's "Bearer token" field was taken
+# for the login password, so the crawl typed the credentials into it and never signed in.
+_MARK_LOGIN_FORM_JS = """() => {
+  const visible = el => !!el && el.offsetParent !== null;
+  const userish = el => visible(el) && el.type !== 'password' && (el.type === 'email' ||
+    /user|email|e-mail|login|account|mobile|phone/i.test([el.name, el.id, el.placeholder,
+      el.autocomplete, el.getAttribute('aria-label')].join(' ')));
+  document.querySelectorAll('[data-crawl-login]').forEach(el => el.removeAttribute('data-crawl-login'));
+  for (const pw of document.querySelectorAll('input[type=password]')) {
+    if (!visible(pw)) continue;
+    let scope = pw.closest('form');
+    if (!scope || ![...scope.querySelectorAll('input')].some(userish)) {
+      scope = null;
+      let node = pw.parentElement;
+      for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+        if ([...node.querySelectorAll('input')].some(userish)) { scope = node; break; }
+      }
+    }
+    if (!scope) continue;
+    pw.setAttribute('data-crawl-login', 'password');
+    scope.setAttribute('data-crawl-login', 'form');
+    const user = [...scope.querySelectorAll('input')].find(userish);
+    if (user) user.setAttribute('data-crawl-login', 'username');
+    return true;
+  }
+  return false;
+}"""
+
+# The control that opens a sign-in form kept behind it - a button that opens a dialog, or a link to
+# a sign-in page, often in a new tab. Exact wording only, so "Sign up" or "Log in with Google" is
+# never followed.
+_LOGIN_TRIGGER = r"^\s*(log\s?in|sign\s?in)\s*$"
+
+
+class _NoLoginForm(Exception):
+    """The page has no sign-in form, so there is nothing to submit the credentials to."""
+
+
+async def _settle(page) -> None:
+    """Best-effort wait for a page to finish loading; never fails."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+    except Exception:
+        pass
+
+
+async def _find_login_form(page) -> bool:
+    """Marks the page's sign-in form; waits for one to render first. False when there is none."""
+    try:
+        await page.locator('input[type="password"]').first.wait_for(
+            state="visible", timeout=LOGIN_FORM_RENDER_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        return bool(await page.evaluate(_MARK_LOGIN_FORM_JS))
+    except Exception:
+        return False
+
+
+async def _reveal_login_form(page, hosted: bool) -> bool:
+    """
+    Opens a sign-in form that the page keeps behind a "Log in" / "Sign in" control.
+
+    A site's front page is often a landing page or a usable signed-out app rather than a login
+    screen: a marketing page whose "Sign In" opens the app's sign-in page in a new tab, or an app
+    whose "Log in" opens a dialog while a help panel that opens on first visit covers the button.
+    A link is followed in this same page so a new-tab target is not lost; a button is clicked once
+    any open panel is closed.
+    """
+    trigger = page.locator("a:visible, button:visible").filter(
+        has_text=re.compile(_LOGIN_TRIGGER, re.IGNORECASE)).first
+    try:
+        if not await trigger.count():
+            return False
+        href = await trigger.evaluate("el => el.tagName === 'A' ? el.href : null")
+        if href and not href.startswith("javascript:"):
+            # The hosted server opens only public addresses, the same check every crawled page gets.
+            if hosted and await validate_public_http_url(href):
+                return False
+            await page.goto(href, wait_until="domcontentloaded", timeout=30_000)
+            await _settle(page)
+        else:
+            await page.keyboard.press("Escape")
+            try:
+                await trigger.click(timeout=5_000)
+            except Exception:
+                await trigger.click(timeout=5_000, force=True)
+    except Exception:
+        return False
+    return await _find_login_form(page)
 
 
 def _dedup_key(url: str) -> str:
@@ -308,20 +402,18 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             # theories instead of the password. Record what happened as we go and report it.
             auth = {"attempted": True, "succeeded": False, "detail": None, "final_url": None}
             login_page = await context.new_page()
-            await login_page.goto(url, wait_until="networkidle", timeout=30_000)
+            # domcontentloaded, then a best-effort settle: a page that keeps a connection open
+            # never goes network-idle, and requiring it timed out a sign-in page that a browser
+            # renders in three seconds.
+            await login_page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await _settle(login_page)
             # networkidle is not "the form has rendered": a client-rendered sign-in page (Next.js,
             # React) mounts its form a beat after the network goes quiet, and on the slower hosted
             # pod the capture below used to run in that gap — pages_crawled: 1, 0 locators, ok:true
             # (live 2026-10-02 against dev.automationhq.ai/login, while a local run of the same
-            # call found all 9). The fill() calls further down never noticed because they auto-wait.
-            # Wait for the password field the same way, then give the rest of the form the settle
-            # time the normal crawl loop already gets. A page with no password field just costs the
-            # timeout and is captured as it is.
-            try:
-                await login_page.locator('input[type="password"]').first.wait_for(
-                    state="visible", timeout=LOGIN_FORM_RENDER_TIMEOUT)
-            except Exception:
-                pass
+            # call found all 9). _find_login_form waits for the password field, and the form then
+            # gets the settle time the normal crawl loop already gives a page.
+            login_form = await _find_login_form(login_page) or await _reveal_login_form(login_page, hosted)
             await login_page.wait_for_timeout(1_000)
             # Capture the sign-in form BEFORE submitting it. This is the only moment it exists in
             # this crawl: once the context holds a session, every later visit to the same URL
@@ -339,14 +431,23 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 # button[type="submit"]) — an unscoped selector matches both, Playwright's
                 # strict-mode click throws on the ambiguity, and the bare except below swallowed
                 # it silently, so the form was never actually submitted despite no visible error.
-                password_field = login_page.locator('input[type="password"]').first
-                form = password_field.locator("xpath=ancestor::form[1]")
-                await form.locator(
-                    'input[type="email"], input[name*="user"], input[name*="email"]'
-                ).first.fill(credentials.get("username", ""))
+                if not login_form:
+                    raise _NoLoginForm()
+                form = login_page.locator('[data-crawl-login="form"]')
+                password_field = login_page.locator('[data-crawl-login="password"]')
+                await login_page.locator('[data-crawl-login="username"]').first.fill(
+                    credentials.get("username", ""))
                 await password_field.fill(credentials.get("password", ""))
                 start_url = login_page.url
-                await form.locator('button[type="submit"], input[type="submit"]').first.click()
+                submit = form.locator('button[type="submit"], input[type="submit"]')
+                if not await submit.count():
+                    # A form without a real submit button signs in from a plain button.
+                    submit = form.locator("button").filter(has_text=re.compile(
+                        r"^\s*(log\s?in|sign\s?in|continue|submit|next)\s*$", re.IGNORECASE))
+                if await submit.count():
+                    await submit.first.click()
+                else:
+                    await password_field.press("Enter")
                 # networkidle alone races the SPA's post-login redirect: there's commonly a brief
                 # network lull right after the login API call resolves and before the client-side
                 # navigation to the authenticated area actually starts, so wait_for_load_state can
@@ -381,6 +482,11 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                         "credentials were most likely rejected")
                 elif auth["detail"] is None:
                     auth["succeeded"] = True
+            except _NoLoginForm:
+                auth["detail"] = (
+                    "no sign-in form was found - not on this page and not behind a 'Log in' / "
+                    "'Sign in' button. Crawl the sign-in page's own URL (e.g. .../login or .../auth) "
+                    "with the credentials. The pages below are what a signed-out visitor sees.")
             except Exception as exc:
                 # Keep the type: str() on a Playwright timeout can be empty, which would render
                 # as "could not complete the sign-in form: " and say nothing at all.

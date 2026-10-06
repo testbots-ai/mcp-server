@@ -35,6 +35,7 @@ from src.tools.locator_usage import find_locator_usage as _find_locator_usage
 from src.tools import locator_validation as _locval
 from src.tools.script_identity import describe_credentials as _describe_credentials
 from src.tools import edit_verification as _editver
+from src.tools import password_steps as _pwsteps
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -588,7 +589,7 @@ TOOLS = [
     Tool(name="list_test_scripts", description="List or search test scripts by name. Returns a summary per script (id, name, status, type, stepCount) — call get_test_script for a script's actual steps. The `name` filter is a plain case-insensitive substring match. Results cover the configured project only; use get_scripts_for_branch to ask which scripts are on a specific branch.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Optional case-insensitive substring filter"}}}),
     Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. A 60+ step script can exceed the result token cap: summary=true gives one line per step, steps_from/steps_to (inclusive, 1-based) one range in full. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that. Its versionCount is what the editing tools' expected_version takes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "summary": {"type": "boolean", "description": "Step titles only"}, "steps_from": {"type": "integer"}, "steps_to": {"type": "integer"}}, "required": ["script_id"]}),
     Tool(name="delete_test_script", description="Delete a test script. This is the SAME soft delete the UI performs — the script is archived (isArchived=true), appears under Administration -> Archive, and can be brought back with restore_asset; it is not destroyed. TWO-PHASE: if the script is still referenced by any Test Set or TestBot, the first call deletes NOTHING and returns status NEEDS_CONFIRMATION listing them (the raw API signals this with a 202 that is easily misread as success). Relay that list to the user and only call again with confirmed=true if they agree — that detaches the script from each one as it deletes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "confirmed": {"type": "boolean", "default": False, "description": "Set true ONLY to confirm a prior NEEDS_CONFIRMATION response, after the user has agreed"}}, "required": ["script_id"]}),
-    Tool(name="add_test_steps", description="Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate. Only inserts - to change a step use replace_test_step.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
+    Tool(name="add_test_steps", description="LOGIN: wait 10s after the submit. No password or vault secret? Type UPDATE_PASSWORD, tell the user to update it, and pass on any password_warning. Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate. Only inserts - to change a step use replace_test_step.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
     Tool(name="replace_test_step", description="Replace the step at `sequence` (1-based) with `steps` - one or more, e.g. a wait then the corrected check. Use to fix or change a step; add_test_steps only inserts. Insert-then-remove, so a failure never loses the step. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequence": {"type": "integer"}, "steps": {"type": "array", "items": {"type": "object"}}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}, "expected_version": {"type": "integer"}}, "required": ["script_id", "sequence", "steps", "branch_name"]}),
     Tool(name="update_test_script", description="Update fields of an existing test script (name, status, story_id, testSteps, ...) — GET-merge-PUT, so unspecified fields are preserved. Pass branch_name for the same reason as add_test_steps. Same protected-branch caveat.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "changes": {"type": "object", "description": "Fields to change, using the entity's own field names (e.g. name, status, storyId, testSteps)"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "changes", "branch_name"]}),
     Tool(name="delete_test_steps", description="Remove steps by 1-based sequence and/or testStepId, renumbering the rest. Use this rather than rebuilding the whole testSteps array via update_test_script — resending every unrelated step to drop one is how unrelated steps get corrupted. All-or-nothing: nothing is deleted unless every sequence/id matches. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequences": {"type": "array", "items": {"type": "integer"}}, "step_ids": {"type": "array", "items": {"type": "string"}}, "branch_name": {"type": "string"}, "expected_version": {"type": "integer"}}, "required": ["script_id"]}),
@@ -597,7 +598,7 @@ TOOLS = [
     Tool(
         name="create_test_script",
         description=(
-            "Create a test script in TestBots. Each step's templateId MUST come from "
+            "Create a test script in TestBots. LOGIN: wait 10s after the submit. No password or vault secret? Type UPDATE_PASSWORD, tell the user to update it, and pass on any password_warning. Each step's templateId MUST come from "
             "list_step_templates/search_step_templates — never invent one. Call get_step_template "
             "on the chosen template first to see which parameter keys it actually uses. "
             "For built-in templates (templateId like 'template-id-N'), also copy that template's "
@@ -1291,8 +1292,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             args["script_id"], args["steps"], args.get("position"),
             branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"))
-        return _editver.annotate_edit(
-            _locval.annotate(result, resolution), args.get("branch_name"))
+        return _pwsteps.annotate(_editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name")),
+            args["steps"], resolution, check_variables=False)
     if name == "replace_test_step":
         # MCP has no step-edit primitive, so "change step 5" used to become add_test_steps at
         # position 4: a corrected step 5 above the old one, which then ran as step 6 and failed
@@ -1325,7 +1327,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
                   "replaced": sequence, "stepsAdded": len(steps)}
         if isinstance(removed, dict) and removed.get("branchName"):
             result["branchName"] = removed["branchName"]
-        return _editver.annotate_edit(_locval.annotate(result, resolution), args.get("branch_name"))
+        return _pwsteps.annotate(
+            _editver.annotate_edit(_locval.annotate(result, resolution), args.get("branch_name")),
+            steps, resolution, check_variables=False)
     if name == "delete_test_steps":
         return _editver.annotate_edit(await clients.test_mgmt.delete_test_steps(
             args["script_id"],
@@ -1351,8 +1355,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         result = await clients.test_mgmt.update_test_script(
             args["script_id"], branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"), **changes)
-        return _editver.annotate_edit(
-            _locval.annotate(result, resolution), args.get("branch_name"))
+        # update_test_script replaces the whole step list, so a variable must be stored within it.
+        return _pwsteps.annotate(_editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name")),
+            changes.get("testSteps") if isinstance(changes, dict) else None, resolution)
     if name == "create_test_script":
         # Schema `required` is advisory — not every MCP client enforces it — and this is the one
         # argument whose wrong value fails silently much later: a script created on protected
@@ -1391,8 +1397,8 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         result = await clients.test_mgmt.create_test_script(
             args["name"], args["steps"], args.get("page_id"), args.get("website_id"), args.get("story_id"), **kwargs
         )
-        return _editver.annotate_edit(
-            _locval.annotate(result, resolution), args.get("branch_name"))
+        return _pwsteps.annotate(_editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name")), args["steps"], resolution)
 
     if name == "list_step_templates":
         return await clients.test_mgmt.list_templates(args.get("offset", 0))

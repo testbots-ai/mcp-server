@@ -125,6 +125,14 @@ generated from it — no live app/URL involved.
   this causes the verify step to run before the page has navigated and fail: the URL/element
   check is a single immediate read with no retry loop, so it sees the page the click was meant
   to leave.
+- **After the step that submits a login, the wait is always 10 seconds** (`template-id-35` with 10,
+  or `template-id-36` on a signed-in page element with 10) - many apps take that long to load
+  after signing in, and a shorter wait fails the first check on a slow day.
+- **A login step needs the real password or a vault secret** (`{"vault": "<secret name>"}`). If the
+  user has given neither, type `UPDATE_PASSWORD` in the password step and tell them plainly that the
+  password must be updated before the script runs - never a made-up variable, a phrase like "the
+  password you gave", or a row of dots. The script-writing tools return `password_warning` when a
+  password step has no real password: always pass it on to the user.
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
 - Always show the traceability matrix before writing scripts, not just in the final summary
 - If the file has an `error` from `extract_requirements`, do not retry — report it to the user

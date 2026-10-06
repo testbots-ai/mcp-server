@@ -122,6 +122,14 @@ The user has a deployed web application and wants test scripts generated automat
   fixed delay, ~5-10s, use when no destination-page locator is known yet). Skipping this causes the
   verify step to run against the pre-navigation page and fail: the URL/element check is a single
   immediate read with no retry loop, so it sees the page the click was meant to leave.
+- **After the step that submits a login, the wait is always 10 seconds** (`template-id-35` with 10,
+  or `template-id-36` on a signed-in page element with 10) - many apps take that long to load
+  after signing in, and a shorter wait fails the first check on a slow day.
+- **A login step needs the real password or a vault secret** (`{"vault": "<secret name>"}`). If the
+  user has given neither, type `UPDATE_PASSWORD` in the password step and tell them plainly that the
+  password must be updated before the script runs - never a made-up variable, a phrase like "the
+  password you gave", or a row of dots. The script-writing tools return `password_warning` when a
+  password step has no real password: always pass it on to the user.
 - Never create a script with 0 steps
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
 - **Agree the granularity before generating at scale.** One script per test case and one script
