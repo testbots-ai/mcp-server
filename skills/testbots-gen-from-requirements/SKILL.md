@@ -1,6 +1,6 @@
 ---
 name: testbots-gen-from-requirements
-description: Read a requirements document and write test scripts that cover it (PDF/DOCX/XLSX/CSV/TXT), grounded in the live app when the document names one
+description: Read a requirements document and write test scripts that cover it (PDF/DOCX/XLSX/CSV/TXT), grounded in the live app when the document names one — into AHQ, or as a portable self-contained bundle
 tools:
   - mcp__testbots-mcp-server__extract_requirements
   - mcp__testbots-mcp-server__get_context
@@ -30,6 +30,13 @@ one), ground the test cases in the real app instead of the document's wording al
 
 ## What to collect before starting
 - Absolute path to the requirements file (required)
+- **Destination — ask before doing anything else, since it changes every step from here**: save
+  the scripts into a real AHQ project (needs `website_id`/`story_id`/a branch, and persists real
+  Website/Page/Locator/TestScript records), or return a **portable bundle** — one self-contained
+  JSON document with no AHQ writes at all, built for a caller (e.g. a testbots.ai customer) who
+  has no AHQ project to write into yet, but wants enough structure to migrate into one later if
+  they choose to. Never guess this from context — a connected org token does not imply the user
+  wants data persisted into it.
 - Target URL — look for one in the document first (a link, a "staging/prod/app URL" field, a
   header). Ask the user only if the document doesn't name one; don't skip testing a live app just
   because asking feels like friction
@@ -120,14 +127,23 @@ one), ground the test cases in the real app instead of the document's wording al
    `get_step_template` if it's unclear which placeholder names (`{{...}}` in `templateTitle`) a
    template expects. **Never invent a templateId.**
 
-10. Call `create_test_script` for each derived test case:
+10. Build each script's steps, resolving every `ui-locator` first: check `get_page_by_url` —
+    step 4 already crawled the app, so the real locator should already be on hand; only fall back
+    to a fresh `crawl_url` call if the page in question wasn't covered (new page found mid-analysis,
+    or step 4 never ran because no URL was known at the time). Only leave a single descriptive
+    placeholder step (flagged as needing manual locator/template work) when no concrete UI target or
+    URL is known at all — never guess a raw selector as a substitute. Then follow **Path A** or
+    **Path B** below, per the Destination collected up front.
+
+### Path A — persist into AHQ
+
+11a. If step 4 crawled a live app, persist it once, before any script: `create_website` for the app
+     (check `get_context`/`list_websites` first — don't duplicate), then `create_page` +
+     `add_locators` per crawled page, so every script below references a real, saved `locatorId`
+     rather than re-deriving one per step.
+
+12a. Call `create_test_script` for each derived test case:
     - Name format: "<Requirement ref> — <Scenario>" (e.g. "REQ-12 — Login with invalid password")
-    - Steps use the templateIds resolved above. If a requirement needs a `ui-locator`, check
-      `get_page_by_url` first — step 4 already crawled the app, so the real locator should already
-      be on hand; only fall back to a fresh `crawl_url` call if the page in question wasn't covered
-      (new page found mid-analysis, or step 4 never ran because no URL was known at the time). Only
-      leave a single descriptive placeholder step (flagged as needing manual locator/template work)
-      when no concrete UI target or URL is known at all — never guess a raw selector as a substitute.
     - Build each step in the exact shape below — it is the proven-working one, and the near-miss
       variants fail in ways that look like success. Each step needs `templateId` +
       `templateTitle` (built-ins only) + a `parameters` array (NOT
@@ -144,8 +160,7 @@ one), ground the test cases in the real app instead of the document's wording al
     - **`website_id` and `story_id` are both REQUIRED** — `create_test_script` validates this locally
       and rejects the call with a clean error if either is missing, matching
       `automationhq-frontend-v2`'s own create-script form (this is a hard requirement now, not a
-      "recommended" field). Pass `website_id` from `create_website`/step 4's crawl if the
-      requirement maps to the app just crawled.
+      "recommended" field). Pass `website_id` from step 11a's `create_website` call.
     - Attach to an epic/story (`story_id`) if the user specified one, or if there's an obviously
       matching one from `get_context`/`list_epics`/`list_stories`. If nothing fits, call
       `create_epic` then `create_story` rather than skipping the field — there is always a way to
@@ -154,16 +169,90 @@ one), ground the test cases in the real app instead of the document's wording al
       you have a real reason to change them. If `status` is set to `"To Be Repaired"`, also pass
       `repair_comment` — required in that case only.
 
-11. If more than a few scripts were created, call `create_suite` and `add_scripts_to_suite` to group
-    them under one suite named after the source file.
+13a. If more than a few scripts were created, call `create_suite` and `add_scripts_to_suite` to
+     group them under one suite named after the source file.
 
-12. Return to the user:
+### Path B — portable bundle (no AHQ writes)
+
+11b. **Never call `create_website`/`create_page`/`add_locators`/`create_test_script`/`create_epic`/
+     `create_story`/`create_suite`/`add_scripts_to_suite`/`create_branch` in this path** — nothing
+     gets persisted into AHQ. `crawl_url`, `search_step_templates`, and `get_step_template` are all
+     still fair game: they only read, and the bundle still needs real `templateId`/`templateTitle`
+     and real locator strategies, not invented ones — grounding discipline doesn't relax just
+     because the result isn't being saved anywhere.
+
+12b. Assemble **one JSON document** for the whole run (not one message per script):
+
+     ```json
+     {
+       "application": { "name": "<app/website name>", "url": "<root url, if step 4 ran>" },
+       "scripts": [
+         {
+           "name": "<Requirement ref> — <Scenario>",
+           "description": "<Given/When/Then summary>",
+           "priority": "critical | high | medium | low",
+           "labels": ["<module or workflow name from step 5, if it ran>"],
+           "steps": [
+             {
+               "templateId": "template-id-N (built-in) or a real Common-Function UUID",
+               "templateTitle": "Enter {{text}} for the {{ui-locator}}",
+               "testStepTitle": "Enter test@example.com for the Email field",
+               "locator": {
+                 "pageId": "<stable slug for this page, e.g. derived from its URL path>",
+                 "pageName": "<page title, exactly as crawl_url captured it>",
+                 "locatorId": "<stable slug for this locator, e.g. page-slug + locator name>",
+                 "locatorName": "<locator label, exactly as crawl_url captured it>",
+                 "locatorStrategies": [
+                   { "key": "xpath", "value": "//*[@id='email']" },
+                   { "key": "css", "value": "#email" }
+                 ]
+               },
+               "data": { "type": 0, "value": "test@example.com" }
+             }
+           ]
+         }
+       ]
+     }
+     ```
+
+     - Omit `locator` on a step with no UI target (e.g. a plain `"Wait for {{number}} seconds"`).
+     - `data.type` is the real TypeValuePair code (`0` literal — the only one this skill should ever
+       emit; `1`/`2`/`3`/`5`/`6`/`7` are data-column/config/runtime/parameter/faker/vault references
+       that only make sense inside a real AHQ project). A built-in with **more than one**
+       non-locator placeholder (rare) gets `data` as a list of `{"placeholder": "<name>", "type":
+       0, "value": "..."}` instead of a single object — name the placeholder so a later migration
+       can still map it back to its `{{...}}` token.
+     - `pageId`/`locatorId` are bundle-local identifiers, not real AHQ ids — there is no AHQ page or
+       locator yet. Keep them **stable and reused** across every step/script in this same bundle that
+       references the same crawled page/element, so a later migration can tell "these 5 steps share
+       one locator" from "these are 5 different ones" without re-crawling. A human-readable slug
+       (e.g. `"login-email-field"`) beats an opaque id — this bundle is meant to be read directly.
+     - This shape carries exactly what a migration needs to reconstruct the real thing later: one
+       `create_website` + one `create_page`/`add_locators` per distinct `pageId` (building each
+       locator's real `locationStrategies` from `locatorStrategies`) + one `create_test_script` per
+       script, swapping each step's bundle-local `locatorId` for the real one `add_locators` returns.
+       Nothing here is thrown away, just not persisted yet.
+
+13b. Return the assembled JSON as your final answer (a fenced code block, or write it to a file if
+     the user asked for one) — there is no tool call that "returns" it; this is the deliverable.
+
+14. Return to the user:
     - The module/feature/workflow breakdown (if step 5 ran) and the login outcome
     - The traceability matrix (requirement → test case → priority), noting anything cut by a count cap
-    - Scripts created (count + names)
+    - Path A: scripts created (count + names). Path B: the bundle itself, plus a one-line note that
+      nothing was written to AHQ
     - Any requirements skipped and why (ambiguous, no clear UI target, duplicate of existing script)
 
 ## Rules
+- **Settle the Destination (AHQ vs. portable bundle) before anything else** — it decides whether
+  `website_id`/`story_id`/branch questions apply at all (Path A) or whether no AHQ write happens in
+  this run (Path B). Never infer it from whether an AHQ org token happens to be connected.
+- **Path B never calls a write tool** — `create_website`, `create_page`, `add_locators`,
+  `create_test_script`, `create_epic`, `create_story`, `create_suite`, `add_scripts_to_suite`,
+  `create_branch` are all off the table. Only `crawl_url`/`search_step_templates`/`get_step_template`
+  (read-only) are used to ground the bundle's content.
+- **A portable bundle still needs real templateIds and real locator strategies** — grounding
+  discipline is the same in both paths; the only thing Path B skips is persistence, not accuracy.
 - **Honor an explicit test-case count exactly** — rank candidates by priority and keep only the top
   N; state in the summary what was cut, never pad or silently generate a different count
 - **Never present an unauthenticated crawl as the full application** when credentials were given —
@@ -178,8 +267,8 @@ one), ground the test cases in the real app instead of the document's wording al
 - Never omit `templateTitle` on a step whose templateId is a built-in (`"template-id-N"`) — causes a 500
 - Never put step values in `params` — use `parameters` (a list); `params` does not drive step titles or execution
 - Never fabricate `locateBy`/`locatorValue` on a `ui-locator` parameter — pass only `{"locatorId": "..."}` and let the server enrich it
-- Never call `create_test_script` without `website_id` and `story_id` — both are validated locally and rejected if missing; resolve or create an epic/story rather than omitting it
-- **Ask the user which branch the scripts should land on before creating them** — offer a new branch alongside the real ones from `list_branches`, and pass the answer as `branch_name`. Do not silently default to `main`: it is protected, so a later `commit_branch` returns 403, the edit stays an uncommitted version, and `execute_bot` keeps running the last committed one — the change appears saved but never executes. The same branch is what `execute_bot` needs as `targetBranchName`, so settle it before the bot runs, not after
+- (Path A only) Never call `create_test_script` without `website_id` and `story_id` — both are validated locally and rejected if missing; resolve or create an epic/story rather than omitting it
+- (Path A only) **Ask the user which branch the scripts should land on before creating them** — offer a new branch alongside the real ones from `list_branches`, and pass the answer as `branch_name`. Do not silently default to `main`: it is protected, so a later `commit_branch` returns 403, the edit stays an uncommitted version, and `execute_bot` keeps running the last committed one — the change appears saved but never executes. The same branch is what `execute_bot` needs as `targetBranchName`, so settle it before the bot runs, not after
 - Never create a script with 0 steps
 - **After any step that can trigger navigation (a submit/sign-in/link click) and before the next
   step that verifies the result, insert a wait step** — `template-id-36` ("Wait for visibility of
@@ -196,7 +285,9 @@ one), ground the test cases in the real app instead of the document's wording al
   (`{"vault": "<secret name>"}`, from `list_config_vault_secrets`) when the user names one or one
   clearly fits, otherwise the password the user gave. If there is neither, type `UPDATE_PASSWORD`
   and tell them plainly that the password must be updated before the script runs - never a
-  made-up variable, a phrase like "the password you gave", or a row of dots.
+  made-up variable, a phrase like "the password you gave", or a row of dots. **`list_config_vault_secrets`
+  is an AHQ-project resource — Path B has no project to call it against, so a Path B password step
+  is always the literal password or `UPDATE_PASSWORD`, never a `{"vault": ...}` reference.**
 - **Copy each step's `templateId` and `templateTitle` exactly as the search returned them, as a
   pair.** A step runs by its templateId whatever its title says; a mismatched pair is corrected to
   the template that has the title, or refused. The script-writing tools return `password_warning` when a
