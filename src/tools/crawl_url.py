@@ -24,6 +24,7 @@ COLLAPSED_MENU_SELECTOR = ", ".join(
     for scope in ("nav", "aside", "[role=\"navigation\"]", "[role=\"menu\"]", "[role=\"menubar\"]", ".ant-menu")
 )
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
+OVERLAY_WAIT_STEPS = 6  # x 500 ms: how long a page is watched for a panel that opens after load
 LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
 
 # Marks the sign-in form for the locators below. A password field counts only when an email or
@@ -293,6 +294,65 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
         return await _crawl(url, credentials, max_pages, hosted, follow_links)
 
 
+# Dialogs and panels open over the page on arrival - a welcome tour, a help panel, a cookie banner.
+# Each is reported with its close control's label, if it has one.
+_OPEN_OVERLAYS_JS = r"""() => {
+  const shown = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  const closer = /^(\u00d7|x|close|dismiss|got it|skip|skip tour|no thanks|maybe later|ok|accept|accept all)$/i;
+  return [...document.querySelectorAll('[role=dialog],[role=alertdialog],[aria-modal="true"],dialog[open]')]
+    .filter(shown).map(e => {
+      const label = e.getAttribute('aria-labelledby');
+      const title = ((label && document.getElementById(label)?.innerText) ||
+                     e.querySelector('h1,h2,h3,h4')?.innerText || '').trim().split('\n')[0].slice(0, 80);
+      const close = [...e.querySelectorAll('button,[role=button],a')].filter(shown).find(b =>
+        /close|dismiss/i.test(b.getAttribute('aria-label') || '') || closer.test((b.innerText || '').trim()));
+      return { title, close: close ? ((close.innerText || '').trim() || close.getAttribute('aria-label')) : null };
+    });
+}"""
+
+
+async def _dismiss_overlays(page) -> list:
+    """
+    Closes whatever is open over the page on arrival and reports how, so a test of the page can do
+    the same first. A help panel that opens on a first visit covered the sidebar of a signed-in
+    app: every click a generated script made landed on the panel, and the run failed on a step that
+    looked correct. Escape is tried first, then the overlay's own close control.
+    """
+    # These typically open a moment after the page has loaded (one measured at 2.3 s), later than
+    # the capture would otherwise start, so watch for one briefly before concluding there is none.
+    overlays = []
+    try:
+        for _ in range(OVERLAY_WAIT_STEPS):
+            overlays = await page.evaluate(_OPEN_OVERLAYS_JS)
+            if overlays:
+                break
+            await page.wait_for_timeout(500)
+    except Exception:
+        return []
+    found = []
+    for overlay in overlays[:3]:
+        closed_with = None
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(500)
+            if len(await page.evaluate(_OPEN_OVERLAYS_JS)) < len(overlays):
+                closed_with = "Press key ESCAPE"
+            elif overlay.get("close"):
+                await page.get_by_role("button", name=overlay["close"]).first.click(timeout=3_000)
+                await page.wait_for_timeout(500)
+                if len(await page.evaluate(_OPEN_OVERLAYS_JS)) < len(overlays):
+                    closed_with = f'Click "{overlay["close"]}"'
+        except Exception:
+            pass
+        found.append({"title": overlay.get("title") or "untitled dialog",
+                      "closes_with": closed_with or "could not be closed automatically"})
+        overlays = await page.evaluate(_OPEN_OVERLAYS_JS)
+        if not overlays:
+            break
+    return found
+
+
 async def _capture_page(page, final_url: str = None) -> dict:
     """One page's locator harvest, in the shape the tool returns per page.
 
@@ -300,6 +360,7 @@ async def _capture_page(page, final_url: str = None) -> dict:
     upserts by page URL, so a redirect (http->https, "/" -> "/home", auth bounce) would otherwise
     file the captured locators under a URL that no longer serves them.
     """
+    overlays = await _dismiss_overlays(page)
     locators = await _extract_locators(page)
     valid_locators = await _validate_locators(page, locators)
     seen = {(loc.get("xpath"), loc.get("text")) for loc in locators}
@@ -317,6 +378,10 @@ async def _capture_page(page, final_url: str = None) -> dict:
         "resolution_rate": resolution_rate,
         "passes_threshold": resolution_rate >= 0.80,
         "menus_expanded": opened,
+        **({"overlays_on_arrival": overlays,
+            "overlay_note": ("These were open over the page when it loaded and would block every click "
+                             "behind them. A test of this page must close them first with the "
+                             "closes_with step, right after the page loads.")} if overlays else {}),
     }
 
 

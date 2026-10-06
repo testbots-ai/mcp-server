@@ -133,6 +133,14 @@ generated from it — no live app/URL involved.
   password must be updated before the script runs - never a made-up variable, a phrase like "the
   password you gave", or a row of dots. The script-writing tools return `password_warning` when a
   password step has no real password: always pass it on to the user.
+- **Check text exactly as `crawl_url` captured it**, not as the user worded it. Icons (+, ×,
+  arrows) are not text: a button showing "+ New Test Bot" has the text "New Test Bot", and a check
+  for the user's wording fails on a page that is correct.
+- **If a crawled page reports `overlays_on_arrival`**, add its `closes_with` step right after that
+  page loads (after the login wait, for the first signed-in page) - a panel left open takes every
+  click meant for the page behind it.
+- A `wait_warning` on a write means a check runs straight after a click: insert the wait before
+  running the script, rather than finding it one failed run at a time.
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
 - Always show the traceability matrix before writing scripts, not just in the final summary
 - If the file has an `error` from `extract_requirements`, do not retry — report it to the user

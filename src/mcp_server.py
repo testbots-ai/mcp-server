@@ -36,6 +36,7 @@ from src.tools import locator_validation as _locval
 from src.tools.script_identity import describe_credentials as _describe_credentials
 from src.tools import edit_verification as _editver
 from src.tools import password_steps as _pwsteps
+from src.tools import wait_steps as _waitsteps
 from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
 
 server = Server("testbots-mcp-server")
@@ -772,7 +773,7 @@ TOOLS = [
     Tool(name="get_performance_report", description="Duration and ROI/time-saved metrics for an ordinary UI execution, by execution_id. Pass/fail detail is get_execution_report on the same id. Unrelated to get_performance_results, which polls a JMeter load test.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
 
     # Application context
-    Tool(name="crawl_url", description="Crawl a live web application and capture real locators (XPath, CSS, aria-label) for test script generation. Opens collapsed menus and flyouts so every navigation item is captured; label-only elements get text XPaths. Run this whenever a test step needs a ui-locator for a page you haven't already captured locators for — never write a step against a hand-guessed selector (e.g. \"input[type='email']\") instead of calling this first.", inputSchema={"type": "object", "properties": {"url": {"type": "string"}, "credentials": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}, "max_pages": {"type": "integer", "default": 20, "description": "Up to 50"}, "follow_links": {"type": "boolean", "default": True, "description": "false: capture only the landing page and its menus"}}, "required": ["url"]}),
+    Tool(name="crawl_url", description="A page's overlays_on_arrival must be closed (its closes_with step) right after it loads in any test. Crawl a live web application and capture real locators (XPath, CSS, aria-label) for test script generation. Opens collapsed menus and flyouts so every navigation item is captured; label-only elements get text XPaths. Run this whenever a test step needs a ui-locator for a page you haven't already captured locators for — never write a step against a hand-guessed selector (e.g. \"input[type='email']\") instead of calling this first.", inputSchema={"type": "object", "properties": {"url": {"type": "string"}, "credentials": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}, "max_pages": {"type": "integer", "default": 20, "description": "Up to 50"}, "follow_links": {"type": "boolean", "default": True, "description": "false: capture only the landing page and its menus"}}, "required": ["url"]}),
     Tool(
         name="extract_requirements",
         description=(
@@ -1292,9 +1293,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             args["script_id"], args["steps"], args.get("position"),
             branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"))
-        return _pwsteps.annotate(_editver.annotate_edit(
+        return _waitsteps.annotate(_pwsteps.annotate(_editver.annotate_edit(
             _locval.annotate(result, resolution), args.get("branch_name")),
-            args["steps"], resolution, check_variables=False)
+            args["steps"], resolution, check_variables=False), args["steps"])
     if name == "replace_test_step":
         # MCP has no step-edit primitive, so "change step 5" used to become add_test_steps at
         # position 4: a corrected step 5 above the old one, which then ran as step 6 and failed
@@ -1327,9 +1328,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
                   "replaced": sequence, "stepsAdded": len(steps)}
         if isinstance(removed, dict) and removed.get("branchName"):
             result["branchName"] = removed["branchName"]
-        return _pwsteps.annotate(
+        return _waitsteps.annotate(_pwsteps.annotate(
             _editver.annotate_edit(_locval.annotate(result, resolution), args.get("branch_name")),
-            steps, resolution, check_variables=False)
+            steps, resolution, check_variables=False), steps)
     if name == "delete_test_steps":
         return _editver.annotate_edit(await clients.test_mgmt.delete_test_steps(
             args["script_id"],
@@ -1356,9 +1357,10 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             args["script_id"], branch_name=args.get("branch_name"),
             expected_version=args.get("expected_version"), **changes)
         # update_test_script replaces the whole step list, so a variable must be stored within it.
-        return _pwsteps.annotate(_editver.annotate_edit(
+        new_steps = changes.get("testSteps") if isinstance(changes, dict) else None
+        return _waitsteps.annotate(_pwsteps.annotate(_editver.annotate_edit(
             _locval.annotate(result, resolution), args.get("branch_name")),
-            changes.get("testSteps") if isinstance(changes, dict) else None, resolution)
+            new_steps, resolution), new_steps)
     if name == "create_test_script":
         # Schema `required` is advisory — not every MCP client enforces it — and this is the one
         # argument whose wrong value fails silently much later: a script created on protected
@@ -1397,8 +1399,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         result = await clients.test_mgmt.create_test_script(
             args["name"], args["steps"], args.get("page_id"), args.get("website_id"), args.get("story_id"), **kwargs
         )
-        return _pwsteps.annotate(_editver.annotate_edit(
-            _locval.annotate(result, resolution), args.get("branch_name")), args["steps"], resolution)
+        return _waitsteps.annotate(_pwsteps.annotate(_editver.annotate_edit(
+            _locval.annotate(result, resolution), args.get("branch_name")), args["steps"], resolution),
+            args["steps"])
 
     if name == "list_step_templates":
         return await clients.test_mgmt.list_templates(args.get("offset", 0))
