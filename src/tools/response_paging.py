@@ -90,6 +90,40 @@ def _iter_script_results(report: dict):
                 yield suite, script
 
 
+def _script_failed(script: dict) -> bool:
+    status = script.get("resultStatus") or script.get("status") or script.get("executionStatus")
+    return str(status).upper() not in ("PASSED", "PASS", "SUCCESS")
+
+
+def focus_report(report: dict, script_id: str | None = None, failed_detail: bool = False) -> dict:
+    """
+    The full per-step report narrowed to the scripts that matter: one script by id, or every
+    failed script. Fixing a failure needs that script end to end - every step up to the failure,
+    its error and media - but not the passing scripts beside it, which on a multi-script bot are
+    most of the report and push the failing one past the token cap. Suites left empty are dropped;
+    every other field of the report is kept as it came.
+    """
+    if not isinstance(report, dict):
+        return report
+    suites_key = "testSuiteResults" if "testSuiteResults" in report else "suiteResults"
+    kept_suites = []
+    for suite in report.get(suites_key) or []:
+        if not isinstance(suite, dict):
+            continue
+        scripts_key = "testScriptResults" if "testScriptResults" in suite else "scriptResults"
+        scripts = [script for script in suite.get(scripts_key) or [] if isinstance(script, dict)
+                   and (script_id is None or str(script.get("testScriptId")) == str(script_id))
+                   and (not failed_detail or _script_failed(script))]
+        if scripts:
+            kept_suites.append({**suite, scripts_key: scripts})
+    focused = {**report, suites_key: kept_suites}
+    focused["view"] = f"script {script_id}" if script_id else "failed_detail"
+    focused["note"] = ("Full per-step detail, narrowed to " + (f"script {script_id}" if script_id else "the failed scripts")
+                       + ". Passing scripts are left out; call with summary=true to see them all."
+                       if kept_suites else "No script matched. Call with summary=true to see the scripts in this run.")
+    return focused
+
+
 def summarize_report(report: dict, failed_only: bool = False) -> dict:
     """
     Collapse an execution report to one row per script, optionally only the ones that failed.

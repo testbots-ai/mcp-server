@@ -38,7 +38,7 @@ from src.tools import edit_verification as _editver
 from src.tools import password_steps as _pwsteps
 from src.tools import wait_steps as _waitsteps
 from src.tools import template_platform as _platform
-from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report
+from src.tools.response_paging import paginate_script as _paginate_script, summarize_report as _summarize_report, focus_report as _focus_report
 
 server = Server("testbots-mcp-server")
 
@@ -770,7 +770,7 @@ TOOLS = [
     Tool(name="list_recent_runs", description="List recent execution reports. With bot_id: that bot's execution history; without: the report list across bots. Start here to find the execution_id that get_execution_report needs.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "limit": {"type": "integer", "default": 10}}}),
 
     # Reporting
-    Tool(name="get_execution_report", description="Screenshots AND the run's video recording ride in this report — screenshotUrl and videoUrl per iteration; there is no separate call for either. Watch the video before theorising about a failure. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}, "summary": {"type": "boolean", "description": "One row per script (status + first failing step). Use first on a multi-script run — the full report routinely exceeds the token cap"}, "failed_only": {"type": "boolean", "description": "Summary, failed scripts only"}}, "required": ["execution_id"]}),
+    Tool(name="get_execution_report", description="Screenshots AND the run's video recording ride in this report — screenshotUrl and videoUrl per iteration; there is no separate call for either. Watch the video before theorising about a failure. On by default for failed steps; use execute_bot screenshotAfterEachStep for passing ones. Full per-step pass/fail report for a FINISHED execution, by execution_id. This is 'what did the last run do' / 'why did it fail'. Siblings: get_execution_status for a run still in progress, get_performance_report for timing/ROI on this same execution.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}, "summary": {"type": "boolean", "description": "One row per script (status + first failing step). Use first on a multi-script run — the full report routinely exceeds the token cap"}, "failed_only": {"type": "boolean", "description": "Summary, failed scripts only"}, "failed_detail": {"type": "boolean", "description": "Full step detail, failed scripts only - for fixing"}, "script_id": {"type": "string", "description": "Full step detail for this one script"}}, "required": ["execution_id"]}),
     Tool(name="get_performance_report", description="Duration and ROI/time-saved metrics for an ordinary UI execution, by execution_id. Pass/fail detail is get_execution_report on the same id. Unrelated to get_performance_results, which polls a JMeter load test.", inputSchema={"type": "object", "properties": {"execution_id": {"type": "string"}}, "required": ["execution_id"]}),
 
     # Application context
@@ -1849,6 +1849,9 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
                       "executionId": resolved} if isinstance(report, dict) else report
         if args.get("summary") or args.get("failed_only"):
             return _summarize_report(report, failed_only=args.get("failed_only", False))
+        if args.get("script_id") or args.get("failed_detail"):
+            return _focus_report(report, script_id=args.get("script_id"),
+                                 failed_detail=bool(args.get("failed_detail")))
         return report
     if name == "get_performance_report":
         return await clients.executor.get_performance_report(args["execution_id"])
