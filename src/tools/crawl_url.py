@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page
 
 from src.config.ahq_services import settings
+from src.tools.open_by_clicking import open_by_clicking as _open_by_clicking
 from src.tools.browser_setup import ensure_chromium, is_missing_browser_error
 from src.tools.url_guard import validate_public_http_url
 
@@ -278,7 +279,8 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
 
 
 async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAGES,
-                    hosted: bool = False, follow_links: bool = True) -> dict:
+                    hosted: bool = False, follow_links: bool = True, open_by_clicking: list = None,
+                    login_url: str = None) -> dict:
     max_pages = max(1, min(int(max_pages or MAX_PAGES), MAX_PAGES_LIMIT))
     if hosted:
         # SSRF guard (Slice 9j): a hosted crawl runs INSIDE the cluster, so a crafted URL
@@ -286,12 +288,12 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
         # addresses. Checked here for the entry URL and again on every dequeued URL below —
         # per-navigation DNS re-resolution is the guard; the rebinding TOCTOU window between
         # check and goto is a documented accepted residual risk (Playwright can't pin IPs).
-        blocked = await validate_public_http_url(url)
+        blocked = await validate_public_http_url(url) or (login_url and await validate_public_http_url(login_url))
         if blocked:
             return {"error": blocked}
 
     async with _CRAWL_SEMAPHORE:
-        return await _crawl(url, credentials, max_pages, hosted, follow_links)
+        return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url)
 
 
 # Dialogs and panels open over the page on arrival - a welcome tour, a help panel, a cookie banner.
@@ -353,18 +355,20 @@ async def _dismiss_overlays(page) -> list:
     return found
 
 
-async def _capture_page(page, final_url: str = None) -> dict:
+async def _capture_page(page, final_url: str = None, opened: bool = False) -> dict:
     """One page's locator harvest, in the shape the tool returns per page.
 
     `final_url` reports where we actually landed rather than where we asked to go: add_locators
     upserts by page URL, so a redirect (http->https, "/" -> "/home", auth bounce) would otherwise
     file the captured locators under a URL that no longer serves them.
     """
-    overlays = await _dismiss_overlays(page)
+    # A page opened by clicking holds the dialog or menu that was asked for: closing overlays would
+    # close it, and expanding navigation would click away from it.
+    overlays = [] if opened else await _dismiss_overlays(page)
     locators = await _extract_locators(page)
     valid_locators = await _validate_locators(page, locators)
     seen = {(loc.get("xpath"), loc.get("text")) for loc in locators}
-    revealed, opened = await _expand_navigation(page, seen)
+    revealed, opened_menus = ({"all": [], "valid": []}, 0) if opened else await _expand_navigation(page, seen)
     locators += revealed["all"]
     valid_locators += revealed["valid"]
     total, valid = len(locators), len(valid_locators)
@@ -377,7 +381,7 @@ async def _capture_page(page, final_url: str = None) -> dict:
         "total_valid": valid,
         "resolution_rate": resolution_rate,
         "passes_threshold": resolution_rate >= 0.80,
-        "menus_expanded": opened,
+        "menus_expanded": opened_menus,
         **({"overlays_on_arrival": overlays,
             "overlay_note": ("These were open over the page when it loaded and would block every click "
                              "behind them. A test of this page must close them first with the "
@@ -434,7 +438,9 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
     return revealed, opened
 
 
-async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True) -> dict:
+async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
+                 open_by_clicking: list = None, login_url: str = None) -> dict:
+    opener_pending = bool(open_by_clicking)
     base_domain = urlparse(url).netloc
     visited: set[str] = set()
     pages_data = []
@@ -470,7 +476,9 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             # domcontentloaded, then a best-effort settle: a page that keeps a connection open
             # never goes network-idle, and requiring it timed out a sign-in page that a browser
             # renders in three seconds.
-            await login_page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # A page behind the login - a list or a settings screen - often shows no sign-in form when
+            # signed out; login_url names the page that does, and the crawl still captures `url`.
+            await login_page.goto(login_url or url, wait_until="domcontentloaded", timeout=30_000)
             await _settle(login_page)
             # networkidle is not "the form has rendered": a client-rendered sign-in page (Next.js,
             # React) mounts its form a beat after the network goes quiet, and on the slower hosted
@@ -606,7 +614,22 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 final_url = page.url
                 visited.add(_dedup_key(final_url))
 
-                pages_data.append(await _capture_page(page, final_url))
+                if opener_pending and _dedup_key(current_url) == _dedup_key(url):
+                    # The page asked for - not where a sign-in landed - with what it hides opened: overlays closed first so
+                    # the clicks land, then the dialog or menu captured as it stands.
+                    opener_pending = False
+                    overlays = await _dismiss_overlays(page)
+                    opening = await _open_by_clicking(page, open_by_clicking)
+                    captured = await _capture_page(page, final_url, opened=True)
+                    captured.update(opening)
+                    if overlays:
+                        captured["overlays_on_arrival"] = overlays
+                        captured["overlay_note"] = ("These were open over the page when it loaded and would block "
+                                                    "every click behind them. A test of this page must close them "
+                                                    "first with the closes_with step, right after the page loads.")
+                    pages_data.append(captured)
+                else:
+                    pages_data.append(await _capture_page(page, final_url))
 
                 # follow_links=False captures the landing page only - enough for a test of its own
                 # menus, without spending a browser on every page they lead to.

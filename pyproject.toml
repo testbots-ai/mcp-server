@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ahq-mcp-server"
-version = "5.15.0"
+version = "5.16.0"
 description = "TestBots.ai MCP server — AI-powered test script generation"
 requires-python = ">=3.11"
 dependencies = [
