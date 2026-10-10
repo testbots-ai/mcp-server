@@ -429,7 +429,13 @@ async def _capture_page(page, final_url: str = None, opened: bool = False) -> di
     valid_locators += revealed["valid"]
     total, valid = len(locators), len(valid_locators)
     resolution_rate = round(valid / total, 2) if total > 0 else 0.0
+    not_found = await _looks_not_found(page, valid)
     return {
+        **({"not_found": True,
+            "not_found_note": ("This URL shows a not-found page, so nothing on it belongs to the app. Do not save "
+                               "this page or its elements. Reach the real page by clicking through from where the user "
+                               "starts - crawl the home page with open_by_clicking set to the link's text, e.g. "
+                               "[\"Test Bots\"] - and use the URL that crawl reports.")} if not_found else {}),
         "url": final_url or page.url,
         "title": await page.title(),
         "locators": valid_locators,
@@ -443,6 +449,30 @@ async def _capture_page(page, final_url: str = None, opened: bool = False) -> di
                              "behind them. A test of this page must close them first with the "
                              "closes_with step, right after the page loads.")} if overlays else {}),
     }
+
+
+_NOT_FOUND_JS = r"""() => {
+    const text = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const title = (document.title || '').toLowerCase();
+    return { text: text.slice(0, 400), title, length: text.length };
+}"""
+
+
+async def _looks_not_found(page, valid_count: int) -> bool:
+    """
+    A page that is the app's not-found screen. A made-up URL (/test-bots for /bots) loads one that
+    says only "Return to Home"; crawled as if it were the page, every element the test needed was
+    missing and the script was saved without them.
+    """
+    try:
+        info = await page.evaluate(_NOT_FOUND_JS)
+    except Exception:
+        return False
+    text, title = info.get("text", ""), info.get("title", "")
+    signals = ("404", "not found", "page not found", "doesn't exist", "does not exist", "return to home", "go back home")
+    if any(s in title for s in ("404", "not found")):
+        return True
+    return info.get("length", 0) < 400 and any(s in text for s in signals)
 
 
 async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
@@ -676,7 +706,9 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     opener_pending = False
                     overlays = await _dismiss_overlays(page)
                     opening = await _open_by_clicking(page, open_by_clicking)
-                    captured = await _capture_page(page, final_url, opened=True)
+                    # A click can move to another page - "Test Bots" in a sidebar does. The elements
+                    # belong to where the clicks ended, so that is the page they are reported under.
+                    captured = await _capture_page(page, page.url, opened=True)
                     captured.update(opening)
                     if overlays:
                         captured["overlays_on_arrival"] = overlays
