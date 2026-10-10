@@ -22,6 +22,7 @@ from src.tool_groups import resolve_tool_names
 from src.tools.crawl_url import crawl_url as _crawl_url
 from src.tools.extract_requirements import extract_requirements as _extract_requirements
 from src.tools.heal_locator import heal_locator as _heal_locator
+from src.tools.check_step_element import check_step_element as _check_step_element
 from src.tools.script_inspection import (
     inspect_script as _inspect_script,
     validate_script_locators as _validate_script_locators,
@@ -541,6 +542,7 @@ TOOLS = [
     # Self-healing locators — detect, propose a fix for, and apply a fix to a locator whose
     # selectors stopped resolving during a real execution.
     Tool(name="scan_broken_locators", description="List locators the platform has already flagged as broken — every location strategy failed during a real execution (the same signal behind AI Brain's maintenance alerts). Call this before heal_locator, rather than guessing which locator needs attention.", inputSchema={"type": "object", "properties": {}}),
+    Tool(name="check_step_element", description="Diagnose a failing step BEFORE proposing a fix: opens the page as the step meets it (signed in, dialog or menu opened) and reports what the step's selector really resolves to - how many matches, what the element shows, whether it is behind an open dialog, covered, hidden or disabled, which framework renders the page - plus the elements that match what the step means. Pass script_id + sequence + branch_name to check a saved step's own element, or locator_value + locate_by. Read-only.", inputSchema={"type": "object", "properties": {"url": {"type": "string", "description": "The page the step acts on"}, "intent": {"type": "string", "description": "What the step means to act on, e.g. 'Name field in the New Test Bot dialog'"}, "script_id": {"type": "string"}, "sequence": {"type": "integer", "description": "1-based step number in the script"}, "branch_name": {"type": "string", "description": "Branch to read the script from"}, "locator_value": {"type": "string"}, "locate_by": {"type": "string", "description": "css or xpath"}, "credentials": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string"}}}, "login_url": {"type": "string", "description": "Sign-in page, when url shows no sign-in form"}, "open_by_clicking": {"type": "array", "items": {"type": "string"}, "description": "Visible texts to click first, in order - what the steps before this one opened"}}, "required": ["url"]}),
     Tool(
         name="heal_locator",
         description=(
@@ -591,7 +593,7 @@ TOOLS = [
 
     # Test scripts
     Tool(name="list_test_scripts", description="List or search test scripts by name. Returns a summary per script (id, name, status, type, stepCount) — call get_test_script for a script's actual steps. The `name` filter is a plain case-insensitive substring match. Results cover the configured project only; use get_scripts_for_branch to ask which scripts are on a specific branch.", inputSchema={"type": "object", "properties": {"name": {"type": "string", "description": "Optional case-insensitive substring filter"}}}),
-    Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. A 60+ step script can exceed the result token cap: summary=true gives one line per step, steps_from/steps_to (inclusive, 1-based) one range in full. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that. Its versionCount is what the editing tools' expected_version takes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "summary": {"type": "boolean", "description": "Step titles only"}, "steps_from": {"type": "integer"}, "steps_to": {"type": "integer"}}, "required": ["script_id"]}),
+    Tool(name="get_test_script", description="Get full details of a test script by ID, including every step. A 60+ step script can exceed the result token cap: summary=true gives one line per step, steps_from/steps_to (inclusive, 1-based) one range in full. NOTE: the returned currentBranchName reflects this request's ambient branch, NOT the script's real branch membership — use get_scripts_for_branch for that. Its versionCount is what the editing tools' expected_version takes.", inputSchema={"type": "object", "properties": {"branch_name": {"type": "string", "description": "Read the script as it is on this branch - pass the branch you are editing or checking; without it you get the caller's checked-out branch"}, "script_id": {"type": "string"}, "summary": {"type": "boolean", "description": "Step titles only"}, "steps_from": {"type": "integer"}, "steps_to": {"type": "integer"}}, "required": ["script_id"]}),
     Tool(name="delete_test_script", description="Delete a test script. This is the SAME soft delete the UI performs — the script is archived (isArchived=true), appears under Administration -> Archive, and can be brought back with restore_asset; it is not destroyed. TWO-PHASE: if the script is still referenced by any Test Set or TestBot, the first call deletes NOTHING and returns status NEEDS_CONFIRMATION listing them (the raw API signals this with a 202 that is easily misread as success). Relay that list to the user and only call again with confirmed=true if they agree — that detaches the script from each one as it deletes.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "confirmed": {"type": "boolean", "default": False, "description": "Set true ONLY to confirm a prior NEEDS_CONFIRMATION response, after the user has agreed"}}, "required": ["script_id"]}),
     Tool(name="add_test_steps", description="LOGIN: wait 10s after the submit. No password or vault secret? Type UPDATE_PASSWORD, tell the user to update it, and pass on any password_warning. Append (or insert) steps into an EXISTING test script in one call — no manual PUT assembly needed. Steps use the same shape as create_test_script (templateId + templateTitle verbatim for built-ins + parameters). Scalar parameter values accept friendly forms: {\"literal\": \"text\"}, {\"configuration\": \"paramName\"}, {\"vault\": \"secretName\"}, {\"variable\": \"varName\"}, {\"data_column\": \"col\"}, {\"faker\": \"Email\"}, {\"parameter\": \"name\"} — or the raw {\"type\": <code>, \"value\": ...}. Sequences renumber automatically. ALWAYS pass branch_name — omitting it lets the edit land on whatever branch the token is ambiently pointed at, not the script's own. NOTE: scripts on a protected branch (often 'main') reject direct edits — create a branch or delete+recreate. Only inserts - to change a step use replace_test_step.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "expected_version": {"type": "integer", "description": "versionCount you last read; edit is refused if it moved, instead of overwriting a concurrent edit"}, "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to add"}, "position": {"type": "integer", "description": "0-based insert position; omit to append at the end"}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}}, "required": ["script_id", "steps", "branch_name"]}),
     Tool(name="replace_test_step", description="Replace the step at `sequence` (1-based) with `steps` - one or more, e.g. a wait then the corrected check. Use to fix or change a step; add_test_steps only inserts. Insert-then-remove, so a failure never loses the step. branch_name rule as add_test_steps.", inputSchema={"type": "object", "properties": {"script_id": {"type": "string"}, "sequence": {"type": "integer"}, "steps": {"type": "array", "items": {"type": "object"}}, "branch_name": {"type": "string", "description": _BRANCH_PIN_HINT}, "expected_version": {"type": "integer"}}, "required": ["script_id", "sequence", "steps", "branch_name"]}),
@@ -1239,6 +1241,26 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         return await _find_locator_usage(
             clients, args["locator_id"],
             include_common_functions=args.get("include_common_functions", True))
+    if name == "check_step_element":
+        locator_value, locate_by = args.get("locator_value"), args.get("locate_by") or "css"
+        step_note = None
+        if not locator_value and args.get("script_id") and args.get("sequence"):
+            script = await clients.test_mgmt.get_test_script(args["script_id"], args.get("branch_name"))
+            step = next((s for s in (script.get("testSteps") or []) if s.get("sequence") == int(args["sequence"])), None)
+            if step is None:
+                return {"error": f"Step {args['sequence']} is not in this script on branch {args.get('branch_name') or 'the checked-out one'}."}
+            element = next((p.get("value") for p in step.get("parameters") or []
+                            if p.get("key") in ("ui-locator", "uiLocator") and isinstance(p.get("value"), dict)), None)
+            if not element or not element.get("locatorValue"):
+                step_note = "This step has no element saved with a selector - it acts on nothing."
+            else:
+                locator_value, locate_by = element["locatorValue"], element.get("locateBy") or "css"
+                step_note = f'Step {args["sequence"]} ("{step.get("testStepTitle") or step.get("templateTitle")}") acts on "{element.get("locatorName")}".'
+        result = await _check_step_element(
+            args["url"], locator_value=locator_value, locate_by=locate_by, intent=args.get("intent"),
+            credentials=args.get("credentials"), login_url=args.get("login_url"),
+            open_by_clicking=args.get("open_by_clicking"), hosted=is_hosted)
+        return {**({"step": step_note} if step_note else {}), **result}
     if name == "heal_locator":
         return await _heal_locator(
             clients.asset, args["locator_id"], args["website_id"],
@@ -1254,7 +1276,7 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
     if name == "list_test_scripts":
         return await clients.test_mgmt.list_test_scripts(args.get("name"))
     if name == "get_test_script":
-        script = await clients.test_mgmt.get_test_script(args["script_id"])
+        script = await clients.test_mgmt.get_test_script(args["script_id"], args.get("branch_name"))
         # Computed from steps already in hand — no extra call, and nothing is added for the
         # majority of scripts that never sign in.
         credentials = _describe_credentials(script)

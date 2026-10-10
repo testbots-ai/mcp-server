@@ -45,6 +45,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "scan_broken_locators",
         "find_locator_usage",
         "heal_locator",
+        "check_step_element",
         "apply_locator_fix",
     ),
     "authoring": (

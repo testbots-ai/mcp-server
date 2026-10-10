@@ -82,7 +82,7 @@ _TEXT_INPUT_TYPES = {"", "text", "email", "password", "search", "tel", "url", "n
 
 
 def _kind_of(element: dict) -> str:
-    tag, kind, role = element.get("tag", ""), element.get("type", ""), element.get("role", "")
+    tag, kind, role = element.get("tag") or "", (element.get("type") or "").lower(), (element.get("role") or "").lower()
     if tag == "textarea" or (tag == "input" and kind in _TEXT_INPUT_TYPES):
         return "TEXTBOX"
     if tag == "select" or role in ("combobox", "listbox"):

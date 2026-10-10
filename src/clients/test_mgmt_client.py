@@ -123,8 +123,13 @@ class TestMgmtClient(BaseAhqClient):
             return [self._slim_script_summary(s) if isinstance(s, dict) else s for s in result]
         return result
 
-    async def get_test_script(self, script_id: str) -> dict:
-        return await self.get(f"/rest/api/stories/scripts/{script_id}")
+    async def get_test_script(self, script_id: str, branch_name: str = None) -> dict:
+        # Without branchName the platform returns the script as it is on the caller's checked-out
+        # branch, not the branch an edit is for. An edit built from that copy and saved onto its
+        # own branch replaced the branch's steps with another branch's - every earlier change to
+        # the script was lost while each edit reported success.
+        params = {"branchName": branch_name} if branch_name else None
+        return await self.get(f"/rest/api/stories/scripts/{script_id}", params=params)
 
     async def create_test_script(
         self,
@@ -221,7 +226,7 @@ class TestMgmtClient(BaseAhqClient):
         # NOTE: direct edits to a script on a PROTECTED branch (often "main") 403 with
         # "Create a working branch and use a Pull Request" — that error is the platform's
         # version-control policy, not a client bug.
-        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version, branch_name)
         if refusal:
             return refusal
         if "testSteps" in changes:
@@ -238,7 +243,7 @@ class TestMgmtClient(BaseAhqClient):
         replacement for the fetch-spec/read-controller/hand-build-PUT detour. Sequences are
         renumbered across the whole script.
         """
-        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version, branch_name)
         if refusal:
             return refusal
         existing = current.get("testSteps") or []
@@ -249,7 +254,7 @@ class TestMgmtClient(BaseAhqClient):
         current["testSteps"] = merged
         return await self._put_script_if_unchanged(script_id, current, branch_name, version)
 
-    async def _steps_for_edit(self, script_id: str, expected_version):
+    async def _steps_for_edit(self, script_id: str, expected_version, branch_name: str = None):
         """
         Read a script for an edit, refusing if it has moved since the caller last looked.
         `versionCount` is TestScript's monotonic counter across all branches, so an unchanged
@@ -262,7 +267,7 @@ class TestMgmtClient(BaseAhqClient):
         a duplicated block and two steps spliced into the middle of a form-entry sequence, and
         nothing in either response indicated a collision.
         """
-        current = await self.get_test_script(script_id)
+        current = await (self.get_test_script(script_id, branch_name) if branch_name else self.get_test_script(script_id))
         if not isinstance(current, dict):
             return None, None, {"error": f"Script {script_id} response was not a document: {current}"}
         version = current.get("versionCount")
@@ -282,7 +287,7 @@ class TestMgmtClient(BaseAhqClient):
         this edit was being assembled. Closes the read-modify-write window itself, so a caller
         who never passes expected_version still cannot silently overwrite a concurrent edit.
         """
-        latest = await self.get_test_script(script_id)
+        latest = await (self.get_test_script(script_id, branch_name) if branch_name else self.get_test_script(script_id))
         if isinstance(latest, dict) and seen_version is not None:
             current_version = latest.get("versionCount")
             if current_version != seen_version:
@@ -306,7 +311,7 @@ class TestMgmtClient(BaseAhqClient):
         """
         if not sequences and not step_ids:
             return {"error": "Pass sequences and/or step_ids — nothing to delete."}
-        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version, branch_name)
         if refusal:
             return refusal
 
@@ -351,7 +356,7 @@ class TestMgmtClient(BaseAhqClient):
         `order` must be a permutation of every existing sequence — a partial list is rejected
         rather than guessed at, since the missing steps' fate would be ambiguous.
         """
-        current, version, refusal = await self._steps_for_edit(script_id, expected_version)
+        current, version, refusal = await self._steps_for_edit(script_id, expected_version, branch_name)
         if refusal:
             return refusal
 

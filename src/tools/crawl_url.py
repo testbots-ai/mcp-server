@@ -263,6 +263,7 @@ async def _extract_locators(page: Page) -> list[dict]:
                 ariaLabel: el.getAttribute('aria-label') || null,
                 placeholder: el.getAttribute('placeholder') || null,
                 label: label || null,
+                inDialog: !!el.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"],dialog[open]'),
                 id: el.id || null,
                 name: el.getAttribute('name') || null,
                 // Kept as the raw position for de-duplication across menu expansions.
