@@ -122,9 +122,42 @@ def _verdict(found: dict, intent: str) -> list[str]:
     return out
 
 
+# Buttons near a field, with whether each is enabled - read before and after typing, to show whether
+# the app saw the text. A value set without the app noticing leaves a dialog's submit disabled.
+_NEARBY_BUTTONS_JS = r"""([selector, isXpath]) => {
+    const el = isXpath ? document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+                       : document.querySelector(selector);
+    if (!el) return [];
+    const scope = el.closest('[role=dialog],[role=alertdialog],[aria-modal="true"],dialog[open],form') || document;
+    return [...scope.querySelectorAll('button,[role=button],input[type=submit]')].filter(b => b.getBoundingClientRect().width > 0)
+        .map(b => ({ text: (b.innerText || b.value || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+                     enabled: !(b.disabled || b.getAttribute('aria-disabled') === 'true') }));
+}"""
+
+
+async def _try_typing(page, locator_value: str, is_xpath: bool, text: str) -> dict:
+    """Types `text` key by key, as a test's Enter step does, and reports what changed. Submits nothing."""
+    target = page.locator(f"xpath={locator_value}" if is_xpath else locator_value).first
+    before = await page.evaluate(_NEARBY_BUTTONS_JS, [locator_value, is_xpath])
+    try:
+        await target.click(timeout=5_000)
+        await target.press_sequentially(text, delay=20, timeout=10_000)
+    except Exception as exc:
+        return {"typed": False, "error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"}
+    await page.wait_for_timeout(800)
+    after = await page.evaluate(_NEARBY_BUTTONS_JS, [locator_value, is_xpath])
+    value = await target.input_value() if await target.evaluate("e => 'value' in e") else None
+    was = {b["text"]: b["enabled"] for b in before}
+    changed = [f'"{b["text"]}" became {"enabled" if b["enabled"] else "disabled"}'
+               for b in after if b["text"] and b["text"] in was and was[b["text"]] != b["enabled"]]
+    return {"typed": True, "field_value_after": value, "buttons_changed": changed,
+            "note": ("Typing reached the app - a test's Enter step on this element works." if changed or value == text
+                     else "The field did not keep the text; the app may need another element or a different action.")}
+
+
 async def check_step_element(url: str, locator_value: str = None, locate_by: str = "css", intent: str = None,
                              credentials: dict = None, login_url: str = None, open_by_clicking: list = None,
-                             hosted: bool = False) -> dict:
+                             hosted: bool = False, try_typing: str = None) -> dict:
     """
     Opens `url` as the step meets it - signed in via `login_url`, with `open_by_clicking` opened - and
     reports what `locator_value` resolves to, what blocks it, and which elements fit `intent` instead.
@@ -173,6 +206,10 @@ async def check_step_element(url: str, locator_value: str = None, locate_by: str
                 except Exception as exc:
                     found = {"count": 0, "error": f"the selector is invalid: {exc}"}
 
+            typing = None
+            if try_typing and locator_value and found and found.get("count"):
+                typing = await _try_typing(page, locator_value, (locate_by or "").lower() == "xpath", try_typing)
+
             suggestions = []
             if intent:
                 candidates = await _validate_locators(page, await _extract_locators(page))
@@ -208,6 +245,8 @@ async def check_step_element(url: str, locator_value: str = None, locate_by: str
         result["selector"] = {"locateBy": locate_by, "locatorValue": locator_value}
         result["resolves_to"] = found
         result["findings"] = _verdict(found, intent or "")
+    if typing is not None:
+        result["try_typing"] = typing
     if intent:
         result["elements_matching_intent"] = suggestions
         if not suggestions:
