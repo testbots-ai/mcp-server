@@ -7,7 +7,17 @@ page behind the dialog, and the model saved a selector from another page in its 
 controls that open it first, by their visible text, puts the element on the page to be captured.
 """
 
+import re
+
 AFTER_CLICK_WAIT_MS = 1_500
+# Controls that change or destroy data - never clicked to reveal an element. Capturing a Delete
+# button needs no click: the crawl reads it from the page. A click on one deletes the item, and on
+# some apps with no confirmation at all.
+NEVER_CLICK = re.compile(
+    r"\b(delete|remove|archive|discard|trash|erase|purge|wipe|reset|clear( all)?|log\s?out|sign\s?out|"
+    r"deactivate|disable|disconnect|revoke|uninstall|unsubscribe|cancel (subscription|plan|account)|"
+    r"run|execute|re-?run|stop|send|submit|publish|deploy|merge|pay|purchase|buy|checkout|"
+    r"confirm|approve|reject|transfer)\b", re.IGNORECASE)
 CLICK_TIMEOUT_MS = 5_000
 
 
@@ -55,6 +65,11 @@ async def open_by_clicking(page, texts) -> dict:
     """
     opened, not_found = [], []
     for text in [t.strip() for t in (texts or []) if isinstance(t, str) and t.strip()]:
+        if NEVER_CLICK.search(text):
+            return {"opened_by_clicking": opened, "could_not_open": [text], "refused": text,
+                    "open_note": (f'"{text}" was not clicked: it changes or deletes data. Its element is '
+                                  "captured without clicking it - crawl the page that shows it, with "
+                                  "open_by_clicking only for what opens that page or dialog.")}
         target = await _visible_target(page, text)
         if target is None:
             not_found.append(text)
