@@ -3,7 +3,7 @@ from difflib import SequenceMatcher
 from playwright.async_api import async_playwright
 
 from src.tools.browser_setup import ensure_chromium, is_missing_browser_error
-from src.tools.crawl_url import _dedup_key, _dismiss_overlays
+from src.tools.crawl_url import _dedup_key, _dismiss_overlays, _goto
 from src.tools.open_by_clicking import open_by_clicking as _open_by_clicking
 from src.tools.url_guard import validate_public_http_url
 
@@ -170,11 +170,16 @@ async def heal_locator(asset_client, locator_id: str, website_id: str, credentia
 
         try:
             page = await browser.new_page()
-            await page.goto(page_url, wait_until="networkidle", timeout=30_000)
+            await _goto(page, page_url, timeout=30_000)
+            try:
+                # Best effort: a page holding a connection open never goes idle.
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
             if credentials:
                 try:
                     if login_url:
-                        await page.goto(login_url, wait_until="domcontentloaded", timeout=30_000)
+                        await _goto(page, login_url, timeout=30_000)
                         await page.wait_for_selector('input[type="password"]', timeout=15_000)
                     await _login(page, credentials)
                 except Exception:
@@ -182,7 +187,7 @@ async def heal_locator(asset_client, locator_id: str, website_id: str, credentia
                 # Signing in usually lands on the app's home page, not the element's page.
                 if _dedup_key(page.url) != _dedup_key(page_url):
                     try:
-                        await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+                        await _goto(page, page_url, timeout=30_000)
                         await page.wait_for_load_state("networkidle", timeout=15_000)
                     except Exception:
                         pass

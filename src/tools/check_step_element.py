@@ -12,7 +12,7 @@ fits instead.
 from playwright.async_api import async_playwright
 
 from src.tools.browser_setup import ensure_chromium, is_missing_browser_error
-from src.tools.crawl_url import _dedup_key, _dismiss_overlays, _extract_locators, _validate_locators
+from src.tools.crawl_url import _dedup_key, _dismiss_overlays, _extract_locators, _goto, _validate_locators
 from src.tools.heal_locator import _kind_of, _login, _similarity
 from src.tools.open_by_clicking import open_by_clicking as _open_by_clicking
 from src.tools.url_guard import validate_public_http_url
@@ -182,7 +182,7 @@ async def check_step_element(url: str, locator_value: str = None, locate_by: str
             page = await browser.new_page()
             signed_in = None
             if credentials:
-                await page.goto(login_url or url, wait_until="domcontentloaded", timeout=30_000)
+                await _goto(page, login_url or url, timeout=30_000)
                 try:
                     await page.wait_for_selector('input[type="password"]', timeout=15_000)
                     await _login(page, credentials)
@@ -190,7 +190,7 @@ async def check_step_element(url: str, locator_value: str = None, locate_by: str
                 except Exception as exc:
                     signed_in = f"sign-in did not complete: {type(exc).__name__}"
             if _dedup_key(page.url) != _dedup_key(url):
-                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                await _goto(page, url, timeout=30_000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:

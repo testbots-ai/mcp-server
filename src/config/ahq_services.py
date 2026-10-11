@@ -149,6 +149,9 @@ class Settings(BaseSettings):
     # (e.g. a future Cursor/Windsurf deep-link scheme).
     ahq_mcp_extra_redirect_uris: str = ""
     ahq_mcp_crawl_concurrency: int = 2
+    # How long one crawl may keep opening new pages. Kept under the callers' own request timeouts
+    # (the in-app assistant waits 180s), so a long crawl returns what it found instead of nothing.
+    ahq_mcp_crawl_time_budget_s: int = 150
     # Extra allowed AHQ gateway base URLs a token's own urlDetails.baseUrl claim may resolve to,
     # beyond the two known hosts (dev/prod — see credentials.KNOWN_BASE_URLS), comma-separated
     # (e.g. a future staging environment).

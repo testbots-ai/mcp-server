@@ -24,7 +24,29 @@ COLLAPSED_MENU_SELECTOR = ", ".join(
     f"{scope} [aria-expanded=\"false\"]:not([data-crawl-expanded])"
     for scope in ("nav", "aside", "[role=\"navigation\"]", "[role=\"menu\"]", "[role=\"menubar\"]", ".ant-menu")
 )
+# Navigation buttons with no href, clicked to learn the page each one opens. Navigation only - a
+# button in the page's content can create, run or delete something.
+NAV_ITEM_SELECTOR = ", ".join(
+    f"{scope} {item}"
+    for scope in ("nav", "aside", "[role=\"navigation\"]")
+    for item in ("button", "[role=\"button\"]", "[role=\"link\"]", "[role=\"menuitem\"]", "[role=\"tab\"]")
+)
+# Sign-out and destructive labels, and layout toggles - collapsing the sidebar hides the labels the
+# rest of its buttons are found by, and the app may remember it.
+NAV_SKIP = re.compile(r"(?i)\b(log\s?out|sign\s?out|delete|remove|archive|reset|clear|disconnect|deactivate|uninstall"
+                      r"|collapse|expand|toggle|theme|dark mode|light mode|language)\b")
+# The items of a menu a navigation button opened - often rendered outside the navigation itself.
+MENU_ITEM_SELECTOR = '[role="menuitem"]'
+MAX_NAV_CLICKS = 25  # per crawl
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
+# A page load that fails the way a busy or flaky site fails - a timeout, a reset connection, a
+# crashed tab, a gateway error - is tried again, with a growing pause, before it counts as failed.
+GOTO_ATTEMPTS = 3
+GOTO_RETRY_PAUSE_MS = 2_000
+RETRY_STATUSES = {429, 502, 503, 504}
+_TRANSIENT_ERROR = re.compile(
+    r"Timeout|net::ERR_(?!NAME_NOT_RESOLVED|CERT_|INVALID_|ABORTED|BLOCKED)|ECONNRESET|socket hang up|Target (page, context or browser )?(has been )?closed"
+    r"|Navigation .*interrupted|frame was detached|Page crashed", re.IGNORECASE)
 OVERLAY_WAIT_STEPS = 6  # x 500 ms: how long a page is watched for a panel that opens after load
 LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
 
@@ -68,6 +90,33 @@ class _NoLoginForm(Exception):
     """The page has no sign-in form, so there is nothing to submit the credentials to."""
 
 
+class _GotoFailed(Exception):
+    """A page that kept failing to load, after every attempt."""
+
+
+def _is_transient(error: Exception) -> bool:
+    return isinstance(error, _GotoFailed) or bool(_TRANSIENT_ERROR.search(f"{type(error).__name__} {error}"))
+
+
+async def _goto(page, url: str, timeout: int = NETWORK_IDLE_TIMEOUT + 20_000):
+    """page.goto, tried again on a failure a retry can fix. Any other failure is raised at once."""
+    last = None
+    for attempt in range(GOTO_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(GOTO_RETRY_PAUSE_MS * attempt / 1000)
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except Exception as error:
+            if not _is_transient(error):
+                raise
+            last = f"{type(error).__name__}: {str(error).splitlines()[0] if str(error) else ''}"
+            continue
+        if response is None or response.status not in RETRY_STATUSES:
+            return response
+        last = f"HTTP {response.status}"
+    raise _GotoFailed(f"{url} did not load after {GOTO_ATTEMPTS} tries (last: {last})")
+
+
 async def _settle(page) -> None:
     """Best-effort wait for a page to finish loading; never fails."""
     try:
@@ -109,7 +158,7 @@ async def _reveal_login_form(page, hosted: bool) -> bool:
             # The hosted server opens only public addresses, the same check every crawled page gets.
             if hosted and await validate_public_http_url(href):
                 return False
-            await page.goto(href, wait_until="domcontentloaded", timeout=30_000)
+            await _goto(page, href, timeout=30_000)
             await _settle(page)
         else:
             await page.keyboard.press("Escape")
@@ -348,7 +397,12 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
             return {"error": blocked}
 
     async with _CRAWL_SEMAPHORE:
-        return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url)
+        try:
+            return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url)
+        except _GotoFailed as failed:
+            # The sign-in page itself never loaded, so nothing behind it could be reached.
+            return {"error": str(failed), "transient": True,
+                    "retry_note": "The site did not respond, which is usually brief - try the same crawl again."}
 
 
 # Dialogs and panels open over the page on arrival - a welcome tour, a help panel, a cookie banner.
@@ -524,9 +578,110 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
     return revealed, opened
 
 
+async def _nav_item_labels(page, selector: str = None) -> list:
+    labels = []
+    items = page.locator(selector or NAV_ITEM_SELECTOR)
+    for index in range(min(await items.count(), MAX_NAV_CLICKS * 3)):
+        item = items.nth(index)
+        try:
+            if not await item.is_visible() or await item.get_attribute("href"):
+                continue
+            label = ((await item.get_attribute("aria-label")) or (await item.inner_text())).strip()
+        except Exception:
+            continue
+        if label and len(label) <= MAX_LOCATOR_TEXT and not NAV_SKIP.search(label) and label not in labels:
+            labels.append(label)
+    return labels
+
+
+async def _nav_item(page, label: str, selector: str = None):
+    items = page.locator(selector or NAV_ITEM_SELECTOR)
+    for index in range(await items.count()):
+        item = items.nth(index)
+        try:
+            text = ((await item.get_attribute("aria-label")) or (await item.inner_text())).strip()
+            if text == label and await item.is_visible():
+                return item
+        except Exception:
+            continue
+    return None
+
+
+async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) -> list:
+    """
+    The pages a navigation's buttons lead to. A sidebar of buttons, not <a href> links, leaves the
+    link list empty - a React Native Web app's whole navigation is like that - so each one is clicked
+    and kept only when the address changes. A button that opens a menu in place (an account menu
+    holding Settings) has that menu's items tried the same way. Only the navigation and the menus it
+    opens are clicked, never page content, and a label naming sign-out or a delete is skipped.
+    """
+    start = page.url
+    found = []
+
+    async def back() -> None:
+        await _goto(page, start)
+        await _settle(page)
+        await _dismiss_overlays(page)
+
+    async def click(item) -> bool:
+        try:
+            await item.click(timeout=5_000)
+            await _settle(page)
+            return True
+        except Exception:
+            return False
+
+    async def landed() -> bool:
+        if page.url == start:
+            return False
+        if urlparse(page.url).netloc == urlparse(start).netloc:
+            found.append(page.url)
+        await back()
+        return True
+
+    # The capture opened collapsed menus, and an open dropdown takes every click on the page for
+    # itself until it is closed.
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(300)
+    await _dismiss_overlays(page)
+
+    def out_of_time() -> bool:
+        return deadline is not None and asyncio.get_running_loop().time() > deadline
+
+    for label in await _nav_item_labels(page):
+        if out_of_time():
+            break
+        if label in tried or len(tried) >= MAX_NAV_CLICKS:
+            continue
+        tried.add(label)
+        item = await _nav_item(page, label)
+        if item is None or not await click(item) or await landed():
+            continue
+        for entry in await _nav_item_labels(page, MENU_ITEM_SELECTOR):
+            if out_of_time():
+                break
+            if entry in tried or len(tried) >= MAX_NAV_CLICKS:
+                continue
+            tried.add(entry)
+            menu_item = await _nav_item(page, entry, MENU_ITEM_SELECTOR)
+            if menu_item is not None and await click(menu_item) and await landed():
+                # Back on the start page with the menu closed: reopened for its next item.
+                opener = await _nav_item(page, label)
+                if opener is None or not await click(opener):
+                    break
+        # A panel or menu opened in place: closed so it cannot cover the next button.
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+    return found
+
+
 async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
                  open_by_clicking: list = None, login_url: str = None) -> dict:
     opener_pending = bool(open_by_clicking)
+    nav_tried: set = set()
+    retried: set = set()
+    not_crawled: list = []
+    deadline = asyncio.get_running_loop().time() + settings.ahq_mcp_crawl_time_budget_s
     base_domain = urlparse(url).netloc
     visited: set[str] = set()
     pages_data = []
@@ -564,7 +719,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             # renders in three seconds.
             # A page behind the login - a list or a settings screen - often shows no sign-in form when
             # signed out; login_url names the page that does, and the crawl still captures `url`.
-            await login_page.goto(login_url or url, wait_until="domcontentloaded", timeout=30_000)
+            await _goto(login_page, login_url or url, timeout=30_000)
             await _settle(login_page)
             # networkidle is not "the form has rendered": a client-rendered sign-in page (Next.js,
             # React) mounts its form a beat after the network goes quiet, and on the slower hosted
@@ -671,6 +826,11 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             visited.add(_dedup_key(pre_auth_page["url"]))
 
         while queue and len(visited) < max_pages:
+            if asyncio.get_running_loop().time() > deadline:
+                # Stopped rather than overrun the caller's own timeout, which would lose every page
+                # already captured. What is left is reported, for a second call to pick up.
+                not_crawled = [u for u in queue if _dedup_key(u) not in visited]
+                break
             current_url = queue.pop(0)
             if _dedup_key(current_url) in visited:
                 continue
@@ -687,7 +847,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 # domcontentloaded is the hard requirement — networkidle is best-effort only.
                 # A page that keeps a persistent connection open (websocket/long-polling) never
                 # goes network-idle, which would otherwise block the crawl on that page forever.
-                await page.goto(current_url, wait_until="domcontentloaded", timeout=NETWORK_IDLE_TIMEOUT + 20_000)
+                await _goto(page, current_url)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
                 except Exception:
@@ -722,6 +882,13 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 # follow_links=False captures the landing page only - enough for a test of its own
                 # menus, without spending a browser on every page they lead to.
                 links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)") if follow_links else []
+                if (follow_links and len(visited) + len(queue) < max_pages
+                        and asyncio.get_running_loop().time() < deadline):
+                    try:
+                        links += await _pages_behind_nav_buttons(page, nav_tried, deadline)
+                    except Exception:
+                        # The page is already captured; a reload that failed only ends the search.
+                        pass
                 for link in links:
                     parsed = urlparse(link)
                     if (
@@ -735,7 +902,19 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 await page.close()
 
             except Exception as e:
-                pages_data.append({"url": current_url, "error": str(e)})
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                if _is_transient(e) and not isinstance(e, _GotoFailed) and current_url not in retried:
+                    # Failed part-way through the capture - a tab that crashed or a page that
+                    # navigated away mid-read. Once more, in a fresh tab.
+                    retried.add(current_url)
+                    visited.discard(_dedup_key(current_url))
+                    queue.insert(0, current_url)
+                    continue
+                pages_data.append({"url": current_url, "error": str(e),
+                                   "transient": _is_transient(e)})
 
         await browser.close()
 
@@ -745,6 +924,19 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
         "total_locators": total_locators,
         "pages": pages_data,
     }
+    if not_crawled:
+        result["not_crawled"] = not_crawled
+        result["not_crawled_note"] = (f"The crawl stopped at its {settings.ahq_mcp_crawl_time_budget_s}s time limit "
+                                      "with these pages still to visit. Crawl the ones a test needs directly, "
+                                      "with follow_links false.")
+    if opener_pending:
+        # url never got its clicks - usually because it is the sign-in page, captured signed out and
+        # not revisited. Saying so stops a caller reading the result as the dialog it asked for.
+        result["could_not_open"] = list(open_by_clicking)
+        result["open_note"] = (f"Nothing was clicked: {url} was not opened for the clicks (a sign-in page is "
+                               "captured signed out and not revisited), so no element here is from what "
+                               "open_by_clicking names. Crawl the page that shows those controls (often the "
+                               "home page) and pass the sign-in page as login_url.")
     if auth is not None:
         if auth["succeeded"] and auth["detail"] is None:
             auth["detail"] = "signed in and reached the authenticated area"
