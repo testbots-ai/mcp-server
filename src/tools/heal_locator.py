@@ -193,7 +193,7 @@ async def heal_locator(asset_client, locator_id: str, website_id: str, credentia
                         pass
             if open_by_clicking:
                 await _dismiss_overlays(page)
-                opening = await _open_by_clicking(page, open_by_clicking)
+                opening = await _open_by_clicking(page, open_by_clicking, hosted)
 
             elements = await page.evaluate(_CANDIDATE_STRATEGIES_JS)
 

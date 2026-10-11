@@ -871,7 +871,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     # the clicks land, then the dialog or menu captured as it stands.
                     opener_pending = False
                     overlays = await _dismiss_overlays(page)
-                    opening = await _open_by_clicking(page, open_by_clicking)
+                    opening = await _open_by_clicking(page, open_by_clicking, hosted)
                     # A click can move to another page - "Test Bots" in a sidebar does. The elements
                     # belong to where the clicks ended, so that is the page they are reported under.
                     captured = await _capture_page(page, page.url, opened=True)

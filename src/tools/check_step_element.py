@@ -197,7 +197,7 @@ async def check_step_element(url: str, locator_value: str = None, locate_by: str
                 pass
             await page.wait_for_timeout(1_000)
             overlays = await _dismiss_overlays(page)
-            opening = await _open_by_clicking(page, open_by_clicking) if open_by_clicking else {}
+            opening = await _open_by_clicking(page, open_by_clicking, hosted) if open_by_clicking else {}
 
             found = None
             if locator_value:

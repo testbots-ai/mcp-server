@@ -19,10 +19,47 @@ NEVER_CLICK = re.compile(
     r"run|execute|re-?run|stop|send|submit|publish|deploy|merge|pay|purchase|buy|checkout|"
     r"confirm|approve|reject|transfer)\b", re.IGNORECASE)
 CLICK_TIMEOUT_MS = 5_000
+NEW_TAB_WAIT_STEPS = 20  # x 500 ms: how long a target="_blank" link is given to open its tab
 
 
 FIND_ATTEMPTS = 10
 FIND_RETRY_MS = 500
+
+
+async def _follow_new_tab(page, new: list, hosted: bool):
+    """The address of a tab the click opened, now loaded in `page`, or None when none opened."""
+    from src.tools.url_guard import validate_public_http_url
+
+    new = [tab for tab in new if tab is not page]
+    if not new:
+        return None
+    tab = new[-1]
+    try:
+        await tab.wait_for_load_state("domcontentloaded", timeout=10_000)
+    except Exception:
+        pass
+    for _ in range(20):  # a tab opened by a link starts at about:blank before its address arrives
+        if tab.url and tab.url != "about:blank":
+            break
+        await tab.wait_for_timeout(250)
+    url = tab.url
+    for extra in new:
+        try:
+            await extra.close()
+        except Exception:
+            pass
+    if not url or url == "about:blank" or (hosted and await validate_public_http_url(url)):
+        return None
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5_000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(AFTER_CLICK_WAIT_MS)
+    except Exception:
+        return None
+    return url
 
 
 async def _visible_target(page, text: str):
@@ -58,12 +95,16 @@ async def _first_visible(page, text: str):
     return None
 
 
-async def open_by_clicking(page, texts) -> dict:
+async def open_by_clicking(page, texts, hosted: bool = False) -> dict:
     """
     Clicks each control in `texts`, in order, waiting after each one. Stops at the first that
     cannot be found or clicked, since the later ones are usually inside what it would have opened.
+
+    A click that opens a new tab - a marketing page's "Sign In" that opens the app's sign-in page
+    with target="_blank" - is followed: the new tab's address is loaded in this page and the tab is
+    closed, so the caller captures what the click opened rather than the page left behind.
     """
-    opened, not_found = [], []
+    opened, not_found, new_tabs = [], [], []
     for text in [t.strip() for t in (texts or []) if isinstance(t, str) and t.strip()]:
         if NEVER_CLICK.search(text):
             return {"opened_by_clicking": opened, "could_not_open": [text], "refused": text,
@@ -74,9 +115,23 @@ async def open_by_clicking(page, texts) -> dict:
         if target is None:
             not_found.append(text)
             break
+        # Tabs are collected as they open: a tab a link opens can appear well after the click returns,
+        # so a list of tabs taken afterwards is not reliable.
+        new_tabs_opened = []
+
+        def collect(tab):  # a plain function: Playwright cannot take a built-in method as a listener
+            new_tabs_opened.append(tab)
+
+        page.context.on("page", collect)
+        try:
+            # A link that opens a new tab can take a few seconds to do it; the wait below is for that.
+            opens_tab = await target.evaluate("el => !!el.closest('a[target=\"_blank\"]')")
+        except Exception:
+            opens_tab = False
         try:
             await target.click(timeout=CLICK_TIMEOUT_MS)
         except Exception:
+            page.context.remove_listener("page", collect)
             not_found.append(text)
             break
         opened.append(text)
@@ -85,7 +140,17 @@ async def open_by_clicking(page, texts) -> dict:
         except Exception:
             pass
         await page.wait_for_timeout(AFTER_CLICK_WAIT_MS)
+        for _ in range(NEW_TAB_WAIT_STEPS if opens_tab else 0):
+            if new_tabs_opened:
+                break
+            await page.wait_for_timeout(500)
+        page.context.remove_listener("page", collect)
+        followed = await _follow_new_tab(page, new_tabs_opened, hosted)
+        if followed:
+            new_tabs.append(followed)
     result = {"opened_by_clicking": opened}
+    if new_tabs:
+        result["opened_in_new_tab"] = new_tabs
     if not_found:
         result["could_not_open"] = not_found
         result["open_note"] = (f'Could not find or click "{not_found[0]}" - check its exact visible text. '
