@@ -557,6 +557,10 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
             await trigger.evaluate("el => el.setAttribute('data-crawl-expanded', 'true')")
             if not await trigger.is_visible():
                 continue
+            # What a test must click to see what this reveals: an account menu's items are not on
+            # the page until it is opened, and a check of one without that click fails every run.
+            opener = await trigger.evaluate(
+                "el => (el.getAttribute('aria-label') || el.innerText || '').trim().split(/\\s*\\n/)[0].slice(0, 60)")
             await trigger.click(timeout=3_000)
             await page.wait_for_timeout(400)
         except Exception:
@@ -573,6 +577,8 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
                  if (loc.get("xpath"), loc.get("text")) not in seen]
         for loc in fresh:
             seen.add((loc.get("xpath"), loc.get("text")))
+            if opener:
+                loc["openedBy"] = opener
         revealed["all"] += fresh
         revealed["valid"] += await _validate_locators(page, fresh)
     return revealed, opened
