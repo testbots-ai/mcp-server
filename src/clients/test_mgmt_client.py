@@ -210,11 +210,18 @@ class TestMgmtClient(BaseAhqClient):
         be pointed at, the next run tested the old version, and nothing in either response said so.
         Passing branch_name pins the destination; the landing branch is always echoed back so the
         caller can see where the edit actually went even when it doesn't.
+
+        The server reads the destination from the `branchName` query parameter, never from the body:
+        without it, TestScriptController#resolveWriteBranch takes the signed-in user's checked-out
+        branch. An organization token has no user, so the body alone looked like it worked; a user's
+        token (the AI Builder's repairs call as the user) landed every edit on whatever branch that
+        user had open in the UI, while the response still named the requested branch.
         """
         if branch_name:
             document["currentBranchName"] = branch_name
         landed = document.get("currentBranchName")
-        result = await self.put(f"/rest/api/stories/scripts/{script_id}", json=document)
+        result = await self.put(f"/rest/api/stories/scripts/{script_id}", json=document,
+                                params={"branchName": branch_name} if branch_name else None)
         if isinstance(result, dict) and landed:
             result["branchName"] = landed
         return result
