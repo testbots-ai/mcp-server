@@ -24,6 +24,7 @@ from src.tools.extract_requirements import extract_requirements as _extract_requ
 from src.tools.heal_locator import heal_locator as _heal_locator
 from src.tools.check_step_element import check_step_element as _check_step_element
 from src.tools.nested_steps import expand_steps as _expand_steps, find_step as _find_step, steps_inside as _steps_inside
+from src.tools import vault_refs as _vault_refs
 from src.tools.script_inspection import (
     inspect_script as _inspect_script,
     validate_script_locators as _validate_script_locators,
@@ -1336,6 +1337,12 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
             "which reflects this request's ambient branch. Omitting it silently moves the edit to "
             "another branch and a later commit_branch will appear to revert your work."
         )}
+
+    if name in _vault_refs.STEP_WRITE_TOOLS:
+        written = args.get("steps") or (args.get("changes") or {}).get("testSteps")
+        missing, existing = await _vault_refs.unknown_secrets(clients, written)
+        if missing:
+            return _vault_refs.refusal(missing, existing)
 
     if name == "add_test_steps":
         # Resolve the element ids BEFORE writing. An id that resolves to nothing is refused; one
