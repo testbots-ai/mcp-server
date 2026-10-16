@@ -37,7 +37,8 @@ def test_raw_shapes_and_locator_refs_pass_through_untouched():
     assert steps[0]["parameters"][0]["value"] == {"type": 0, "value": "x"}
     assert steps[0]["parameters"][0]["paramClass"] == "already.Set"
     assert steps[0]["parameters"][1]["value"] == {"locatorId": "abc"}
-    assert "paramClass" not in steps[0]["parameters"][1]
+    # The value is untouched, but the editor needs the class to show the element at all.
+    assert steps[0]["parameters"][1]["paramClass"] == "ai.automationhq.commons.entities.assets.UILocator"
 
 
 def test_full_code_table_documented():

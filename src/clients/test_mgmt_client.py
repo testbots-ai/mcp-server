@@ -56,6 +56,8 @@ TYPE_VALUE_PAIR_CODES = {
 }
 
 _TVP_CLASS = "ai.automationhq.commons.entities.assets.TypeValuePair"
+_UI_LOCATOR_CLASS = "ai.automationhq.commons.entities.assets.UILocator"
+_LOCATOR_KEYS = ("ui-locator", "uiLocator")
 
 # List endpoints reject size<=0 in at least some deployments ("Page size must not be less than
 # one" — hit live on AHQ2.0 Master while the same -1/-1 worked on another org). 0/500 works
@@ -89,6 +91,13 @@ def _normalize_step_parameters(steps):
                 if key in TYPE_VALUE_PAIR_CODES:
                     param["value"] = {"type": TYPE_VALUE_PAIR_CODES[key], "value": value[key]}
                     param.setdefault("paramClass", _TVP_CLASS)
+            # The step editor recognises an element or a value by paramClass alone: a step saved
+            # without it runs, but opens as "Locator is required" with the element field empty.
+            if not param.get("paramClass") and isinstance(param.get("value"), dict):
+                if param.get("key") in _LOCATOR_KEYS:
+                    param["paramClass"] = _UI_LOCATOR_CLASS
+                elif "type" in param["value"]:
+                    param["paramClass"] = _TVP_CLASS
     return steps
 
 
