@@ -384,7 +384,7 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
 
 async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAGES,
                     hosted: bool = False, follow_links: bool = True, open_by_clicking: list = None,
-                    login_url: str = None) -> dict:
+                    login_url: str = None, open_each: list = None) -> dict:
     max_pages = max(1, min(int(max_pages or MAX_PAGES), MAX_PAGES_LIMIT))
     if hosted:
         # SSRF guard (Slice 9j): a hosted crawl runs INSIDE the cluster, so a crafted URL
@@ -398,7 +398,8 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
 
     async with _CRAWL_SEMAPHORE:
         try:
-            return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url)
+            return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url,
+                                open_each)
         except _GotoFailed as failed:
             # The sign-in page itself never loaded, so nothing behind it could be reached.
             return {"error": str(failed), "transient": True,
@@ -681,9 +682,47 @@ async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) ->
     return found
 
 
+MAX_OPEN_EACH = 12
+
+
+def _clean_texts(texts) -> list:
+    if isinstance(texts, str):
+        texts = [texts]
+    return [t.strip() for t in (texts or []) if isinstance(t, str) and t.strip()]
+
+
+def _click_path(entry) -> list:
+    """An open_each entry as the texts to click: "A > B" (or a list) is A, then B."""
+    if isinstance(entry, str):
+        entry = entry.split(" > ")
+    return _clean_texts(entry)
+
+
+def _openers(open_by_clicking, open_each) -> list:
+    """
+    The click paths to capture, one page entry each. open_by_clicking alone is one path, as it has
+    always been. Each open_each entry - a control's text, or "A > B" for texts clicked in order - is
+    its own path, prefixed by open_by_clicking when both are given.
+    """
+    prefix = _clean_texts(open_by_clicking)
+    if isinstance(open_each, str):
+        open_each = [open_each]
+    each = [_click_path(entry) for entry in (open_each or [])][:MAX_OPEN_EACH]
+    each = [entry for entry in each if entry]
+    if not each:
+        return [prefix] if prefix else []
+    return [prefix + entry for entry in each]
+
+
+def _opener_label(clicks: list) -> str:
+    return " > ".join(clicks)
+
+
 async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
-                 open_by_clicking: list = None, login_url: str = None) -> dict:
-    opener_pending = bool(open_by_clicking)
+                 open_by_clicking: list = None, login_url: str = None, open_each: list = None) -> dict:
+    openers = _openers(open_by_clicking, open_each)
+    opener_pending = bool(openers)
+    unopened: list = []
     nav_tried: set = set()
     retried: set = set()
     not_crawled: list = []
@@ -878,18 +917,38 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     # The page asked for - not where a sign-in landed - with what it hides opened: overlays closed first so
                     # the clicks land, then the dialog or menu captured as it stands.
                     opener_pending = False
-                    overlays = await _dismiss_overlays(page)
-                    opening = await _open_by_clicking(page, open_by_clicking, hosted)
-                    # A click can move to another page - "Test Bots" in a sidebar does. The elements
-                    # belong to where the clicks ended, so that is the page they are reported under.
-                    captured = await _capture_page(page, page.url, opened=True)
-                    captured.update(opening)
-                    if overlays:
-                        captured["overlays_on_arrival"] = overlays
-                        captured["overlay_note"] = ("These were open over the page when it loaded and would block "
-                                                    "every click behind them. A test of this page must close them "
-                                                    "first with the closes_with step, right after the page loads.")
-                    pages_data.append(captured)
+                    for index, clicks in enumerate(openers):
+                        if index:
+                            # Each menu or dialog is opened from the page as it loads, not from the
+                            # one before: opening one menu closes the last, so clicking them in a row
+                            # would capture only the final one. One signed-in browser serves them all.
+                            if asyncio.get_running_loop().time() > deadline:
+                                unopened += [_opener_label(c) for c in openers[index:]]
+                                break
+                            try:
+                                await _goto(page, current_url)
+                            except Exception:
+                                # Only this entry is lost: re-raising would retry the whole page and
+                                # report the menus already captured twice.
+                                unopened.append(_opener_label(clicks))
+                                continue
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(1_000)
+                        overlays = await _dismiss_overlays(page)
+                        opening = await _open_by_clicking(page, clicks, hosted)
+                        # A click can move to another page - "Test Bots" in a sidebar does. The elements
+                        # belong to where the clicks ended, so that is the page they are reported under.
+                        captured = await _capture_page(page, page.url, opened=True)
+                        captured.update(opening)
+                        if overlays:
+                            captured["overlays_on_arrival"] = overlays
+                            captured["overlay_note"] = ("These were open over the page when it loaded and would block "
+                                                        "every click behind them. A test of this page must close them "
+                                                        "first with the closes_with step, right after the page loads.")
+                        pages_data.append(captured)
                 else:
                     pages_data.append(await _capture_page(page, final_url))
 
@@ -943,10 +1002,16 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
         result["not_crawled_note"] = (f"The crawl stopped at its {settings.ahq_mcp_crawl_time_budget_s}s time limit "
                                       "with these pages still to visit. Crawl the ones a test needs directly, "
                                       "with follow_links false.")
+    if unopened:
+        result["could_not_open"] = unopened
+        result["open_note"] = ("These were not opened - the page did not reload for them, or the crawl reached "
+                               f"its {settings.ahq_mcp_crawl_time_budget_s}s time limit. Crawl them in a second "
+                               "call with open_each set to just these.")
     if opener_pending:
         # url never got its clicks - usually because it is the sign-in page, captured signed out and
         # not revisited. Saying so stops a caller reading the result as the dialog it asked for.
-        result["could_not_open"] = list(open_by_clicking)
+        result["could_not_open"] = ([_opener_label(c) for c in openers] if open_each
+                                    else list(open_by_clicking))
         result["open_note"] = (f"Nothing was clicked: {url} was not opened for the clicks (a sign-in page is "
                                "captured signed out and not revisited), so no element here is from what "
                                "open_by_clicking names. Crawl the page that shows those controls (often the "
