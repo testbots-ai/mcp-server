@@ -794,7 +794,15 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 # A changed URL alone is not proof: a form that submits as GET, or posts back to
                 # itself, moves the URL while leaving you on the sign-in screen. A completed
                 # sign-in stops rendering a password field; a rejected one re-renders it with an
-                # error. That is the signal that distinguishes them.
+                # error. That is the signal that distinguishes them - but only once the app has
+                # finished moving: right after an accepted sign-in on app.automationhq.ai the URL
+                # is already the transitional /checking while the sign-in form is still mounted,
+                # and counting the field at that instant reported a correct password as rejected.
+                try:
+                    await login_page.locator('input[type="password"]').first.wait_for(
+                        state="detached", timeout=10_000)
+                except Exception:
+                    pass
                 if await login_page.locator('input[type="password"]').count():
                     auth["succeeded"] = False
                     auth["detail"] = auth["detail"] or (
