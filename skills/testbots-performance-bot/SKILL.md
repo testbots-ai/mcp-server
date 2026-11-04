@@ -1,11 +1,12 @@
 ---
 name: testbots-performance-bot
-description: Run a Performance Bot (load test), check a run, compare runs, and give its Smart Summary
+description: Run a Performance Bot (load test), adjust its SLA or load first, compare runs, and give its Smart Summary
 tools:
   - mcp__testbots-mcp-server__get_context
   - mcp__testbots-mcp-server__list_performance_bots
   - mcp__testbots-mcp-server__get_performance_bot
   - mcp__testbots-mcp-server__run_performance_bot
+  - mcp__testbots-mcp-server__update_performance_bot
   - mcp__testbots-mcp-server__stop_performance_bot
   - mcp__testbots-mcp-server__list_performance_runs
   - mcp__testbots-mcp-server__get_performance_results
@@ -35,24 +36,48 @@ a name found by `list_bots` is not a Performance Bot.
      Performance Bots. Do not fall back to a UI TestBot with a similar name.
 
 ### Run it (only when the user asks to run)
-2. Call `get_performance_bot(bot_id)` and state what is about to happen: peak virtual users,
-   ramp-up and hold per load stage, the target environment, and the SLA thresholds if any. A load
-   test puts real load on that environment, so if the user named a production-looking
-   environment, confirm before starting.
-3. Call `run_performance_bot(bot_id)`. The response carries `performanceMetricId`: that is the run.
-4. While it runs, `get_performance_results(metrics_id)` gives live numbers. Poll with widening
+2. Call `get_performance_bot(bot_id)` and show the load plan: each load stage (users, ramp-up,
+   hold), the total duration, the collection environment, and the current SLA thresholds (or
+   "No SLA set"). Then ask: **"Run it as is, or change anything first?"** A load test puts real
+   load on that environment, so if it looks like production, confirm before starting.
+3. If the user wants changes (see **Change the bot** below), make them first, then show the
+   updated plan once more and run.
+4. Call `run_performance_bot(bot_id)`. The response carries `performanceMetricId`: that is the run.
+5. While it runs, `get_performance_results(metrics_id)` gives live numbers. Poll with widening
    gaps (~60s, then 2 min, then 5 min). Stop when `finalPacket` is true or the status is
    COMPLETED, STOPPED, FAILED or TIMED_OUT. For a long run, give one progress update and offer
    to check back rather than polling for an hour.
-5. When it ends, go to **Summarise a run** with this run's id.
-6. To stop a run, call `stop_performance_bot(bot_id)` only when the user asks.
+6. When it ends, go to **Summarise a run** with this run's id.
+7. To stop a run, call `stop_performance_bot(bot_id)` only when the user asks.
+
+### Change the bot (SLA, load stages, environment)
+Use `update_performance_bot`. It changes the saved bot, so every later run uses the new
+settings. Say that once.
+
+- **SLA**: pass only the thresholds the user named, e.g. "p95 under 800 ms and errors below
+  1%" → `sla={"p95_ms": 800, "error_percent": 1}`. Other thresholds stay as they are. `null`
+  removes one ("drop the throughput target" → `{"throughput": null}`). Error % is a percentage
+  (1 = 1%), throughput is requests per second.
+- **Load stages**: `load_stages` REPLACES every stage. To change one thing ("make it 20
+  users"), start from the current stages and change only that, keeping ramp-up and hold.
+  Limits: users 1-1000, ramp-up and hold 1-3600 seconds each.
+- **Environment**: the API collection environment name the requests resolve against. An unknown
+  name is refused with the list of valid ones.
+
+Always two steps:
+1. Call **without** `confirm`. It saves nothing and returns `changes` (before → after per
+   setting). Show that as a short before → after list and ask the user to confirm.
+2. Only after a yes, call again with the same arguments and `confirm=true`.
+
+If the user changed their mind, nothing was saved and nothing needs undoing. The tool refuses
+while the bot is running: offer to stop the run or wait.
 
 ### Summarise a run
-7. No run id from this chat? Call `list_performance_runs(bot_id, size=5)`. It is newest first,
+8. No run id from this chat? Call `list_performance_runs(bot_id, size=5)`. It is newest first,
    so the first entry is the latest run. Pick the one the user means.
-8. If that run is still RUNNING, STARTING or ENQUEUED, say so and give the live numbers from
+9. If that run is still RUNNING, STARTING or ENQUEUED, say so and give the live numbers from
    `get_performance_results`. There is no Smart Summary until it ends.
-9. Call `get_performance_smart_summary(metrics_id)` and act on `status`:
+10. Call `get_performance_smart_summary(metrics_id)` and act on `status`:
    - **COMPLETED**: present `summary` in the Smart Summary format below.
    - **PENDING / RUNNING**: being written now (up to about a minute after the run ends). Wait
      ~20s and call again, up to 3 times.
@@ -63,7 +88,7 @@ a name found by `list_bots` is not a Performance Bot.
      fallback summary and say why the Smart Summary is missing.
 
 ### Compare runs ("is it getting slower?", "compare with last week")
-10. Call `list_performance_runs(bot_id, size=10)`. Use only COMPLETED runs. Give a small table
+11. Call `list_performance_runs(bot_id, size=10)`. Use only COMPLETED runs. Give a small table
     with date, peak users, p95, error %, and SLA verdict per run, then say in one line whether p95
     and error % are improving, flat or worsening. Only compare runs that had the same load
     profile; if users or duration changed between runs, say the runs are not comparable.

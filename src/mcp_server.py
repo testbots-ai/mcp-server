@@ -815,6 +815,7 @@ TOOLS = [
     Tool(name="list_performance_bots", description="List JMeter-backed load/performance bots only. NOT the answer to 'show me my bots' — that is list_bots; these are a separate mtaf-core product surface and this list is empty in most projects.", inputSchema={"type": "object", "properties": {}}),
     Tool(name="get_performance_bot", description="Get full details of a performance bot by ID.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
     Tool(name="run_performance_bot", description="Run an existing performance bot by ID. Runs async in the background (can take hours) — returns a metrics ID immediately for polling via get_performance_results; once it ends, get_performance_smart_summary has the AI summary.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
+    Tool(name="update_performance_bot", description="Change an existing performance bot's current SLA, load stages or collection environment, e.g. before a run. Call WITHOUT confirm first: returns a before/after preview and saves nothing. Show it, and call again with confirm=true only after the user agrees. Refused while the bot is running.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "sla": {"type": "object", "description": "Thresholds to set on the current SLA; only the keys given change, null removes one. Keys: p95_ms, median_ms, error_percent, throughput (req/s), network_latency_ms, users"}, "load_stages": {"type": "array", "description": "Replaces ALL stages, in order", "items": {"type": "object", "properties": {"users": {"type": "integer", "description": "1-1000"}, "ramp_up_seconds": {"type": "integer", "description": "1-3600"}, "hold_seconds": {"type": "integer", "description": "1-3600"}}, "required": ["users", "ramp_up_seconds", "hold_seconds"]}}, "environment": {"type": "string", "description": "Collection environment name; empty string clears it"}, "confirm": {"type": "boolean", "default": False}}, "required": ["bot_id"]}),
     Tool(name="stop_performance_bot", description="Stop a running performance bot.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
     Tool(name="get_performance_results", description="Poll a running JMeter LOAD test (throughput, response times, error rate) by the metrics ID from run_performance_bot. Not for UI executions — those are get_execution_report / get_performance_report, which take an execution_id.", inputSchema={"type": "object", "properties": {"metrics_id": {"type": "string"}, "polling": {"type": "boolean", "default": True}}, "required": ["metrics_id"]}),
     Tool(name="list_performance_runs", description="Past runs of one performance bot, newest first, with status, counts, percentiles and SLA verdict. Finds a run not started in this chat; each id is the metrics_id for the results and smart-summary tools.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "page": {"type": "integer", "default": 0}, "size": {"type": "integer", "default": 10, "description": "Runs per page, max 50"}, "include_endpoints": {"type": "boolean", "default": False, "description": "Add per-endpoint stats, worst first"}}, "required": ["bot_id"]}),
@@ -1979,6 +1980,13 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         return await clients.managed_testing.get_performance_bot(args["bot_id"])
     if name == "run_performance_bot":
         return await clients.managed_testing.run_performance_bot(args["bot_id"])
+    if name == "update_performance_bot":
+        stages = args.get("load_stages")
+        return await clients.managed_testing.update_performance_bot(
+            args["bot_id"], args.get("sla"),
+            [dict(st) for st in stages] if stages is not None else None,
+            args.get("environment"), bool(args.get("confirm", False)),
+        )
     if name == "stop_performance_bot":
         return await clients.managed_testing.stop_performance_bot(args["bot_id"])
     if name == "get_performance_results":

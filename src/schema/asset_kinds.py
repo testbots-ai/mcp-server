@@ -521,9 +521,60 @@ class ArchiveAssetArgs(ArchiveListArgs):
         return v
 
 
+# From SchemaRampStrategy / SchemaSlaRequirement in automationhq-frontend-v2
+# (library/schemas/integrations/mtaf/performance-bot): users 1-1000, ramp-up and hold 1-3600 s,
+# SLA thresholds non-negative numbers.
+PERF_SLA_KEYS = {"p95_ms", "median_ms", "error_percent", "throughput", "network_latency_ms", "users"}
+
+
+class LoadStageIn(_Args):
+    users: int = Field(ge=1, le=1000)
+    ramp_up_seconds: int = Field(ge=1, le=3600)
+    hold_seconds: int = Field(ge=1, le=3600)
+
+
+class UpdatePerformanceBotArgs(_Args):
+    bot_id: str
+    sla: dict | None = None
+    load_stages: list[LoadStageIn] | None = None
+    environment: str | None = None
+    confirm: bool = False
+
+    @field_validator("sla")
+    @classmethod
+    def _sla_rules(cls, v):
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("give at least one SLA threshold")
+        unknown = set(v) - PERF_SLA_KEYS
+        if unknown:
+            raise ValueError(f"unknown SLA keys {sorted(unknown)}; use {sorted(PERF_SLA_KEYS)}")
+        for key, value in v.items():
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{key} must be a number of 0 or more, or null to remove it")
+        return v
+
+    @field_validator("load_stages")
+    @classmethod
+    def _stages_rules(cls, v):
+        if v is not None and not 1 <= len(v) <= 20:
+            raise ValueError("give 1 to 20 load stages")
+        return v
+
+    @model_validator(mode="after")
+    def _something_to_change(self):
+        if self.sla is None and self.load_stages is None and self.environment is None:
+            raise ValueError("nothing to change: give sla, load_stages or environment")
+        return self
+
+
 # Tool name -> validator model. Only tools that create/schedule something need an entry; read-only
 # tools have nothing to validate.
 VALIDATORS: dict[str, type[_Args]] = {
+    "update_performance_bot": UpdatePerformanceBotArgs,
     "create_test_script": TestScriptCreateArgs,
     "create_suite": SuiteCreateArgs,
     "add_scripts_to_suite": AddScriptsToSuiteArgs,

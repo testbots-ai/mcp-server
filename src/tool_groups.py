@@ -173,6 +173,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "list_performance_bots",
         "get_performance_bot",
         "run_performance_bot",
+        "update_performance_bot",
         "stop_performance_bot",
         "get_performance_results",
         "list_performance_runs",
