@@ -1,6 +1,6 @@
 ---
 name: testbots-performance-bot
-description: Run a Performance Bot (load test), adjust its SLA or load first, compare runs, and give its Smart Summary
+description: Run a Performance Bot (load test), adjust its SLA or load first, compare runs, and show its Smart Summary
 tools:
   - mcp__testbots-mcp-server__get_context
   - mcp__testbots-mcp-server__list_performance_bots
@@ -83,9 +83,9 @@ while the bot is running: offer to stop the run or wait.
      ~20s and call again, up to 3 times.
    - **NOT_AVAILABLE** or **FAILED**: offer to write it with
      `regenerate_performance_smart_summary`. It spends the organisation's AI credits, so ask
-     first. If the user agrees, poll as for PENDING. If they decline, write the fallback.
-   - **NOT_CONFIGURED** (no AI provider key) or **QUOTA_EXCEEDED** (daily AI limit): write the
-     fallback summary and say why the Smart Summary is missing.
+     first. If the user agrees, poll as for PENDING. If they decline, give the run's numbers.
+   - **NOT_CONFIGURED** or **QUOTA_EXCEEDED** on a stored summary, or `regenerate` refused with
+     an error: the platform's AI settings block it. See **When the platform cannot write one**.
 
 ### Compare runs ("is it getting slower?", "compare with last week")
 11. Call `list_performance_runs(bot_id, size=10)`. Use only COMPLETED runs. Give a small table
@@ -94,8 +94,6 @@ while the bot is running: offer to stop the run or wait.
     profile; if users or duration changed between runs, say the runs are not comparable.
 
 ## Smart Summary format
-
-Use this for both the stored summary and the fallback, so the user always sees the same shape.
 
 **{Bot name}: {run name}** · {status} · {start time, local} · {duration} · {peak users}
 **Verdict: {HEALTHY | DEGRADED | CRITICAL}** ({confidence} confidence): {headline}
@@ -112,39 +110,21 @@ null, write "No SLA set". Do not write "passed".
 **Recommendations**
 1. numbered, most valuable first, from `recommendations`
 
-## Fallback summary: write it yourself, with the platform's rules
+## When the platform cannot write one
 
-When no stored Smart Summary is available, write one in the same format from what the tools
-return, applying the rules the platform's own Smart Summary uses:
+The Smart Summary belongs to the organisation's AI settings (Settings > AI Provider): it runs on
+their key and model, under their daily limit, and only while AI Test Builder is turned on. When
+the platform refuses, respect that: do **not** write a verdict, findings or recommendations of
+your own in its place.
 
-**Evidence to gather**
-- `list_performance_runs(bot_id, size=5, include_endpoints=true)`: the run (status,
-  `failureReason`, overall percentiles, sample and error counts, `slaVerdict`), its endpoints
-  worst first, and the previous COMPLETED run for comparison.
-- `get_performance_bot(bot_id)`: load stages and SLA thresholds.
-- `get_performance_results(metrics_id, polling=false)`: throughput and peak threads.
-
-**Rules**
-- Use only this evidence. Quote the number behind each statement, with units (ms, %, req/s,
-  users). Never invent endpoints, numbers or causes.
-- **Verdict.** HEALTHY when the run completed with a low error rate and met its SLA, or has no
-  SLA and latency looks reasonable. DEGRADED when it completed but missed an SLA threshold, had a
-  notable error rate, or latency rose under load. CRITICAL when the run failed, timed out, mostly
-  errored, or badly missed its SLA.
-- If the run was STOPPED, FAILED or TIMED_OUT, say so in the headline and explain why from
-  `failureReason`. Do not judge latency from a run with few samples.
-- **SLA:** compare each configured threshold to the measured value.
-- **Bottlenecks:** at most 5 endpoints clearly slower or failing more than the rest, each with
-  its numbers. None if nothing stands out.
-- **Comparison:** p95, error % and throughput against the previous completed run, saying
-  better, similar or worse.
-- **Recommendations:** at most 5 concrete next steps (fix an endpoint, raise a timeout, adjust
-  the ramp-up, add or tune an SLA, investigate the server), most valuable first.
-- **Confidence:** at most MEDIUM. The fallback has no per-minute trend or grouped error
-  messages, so it cannot see whether latency grew as load rose. LOW when the run produced few or
-  no samples.
-- End with one line: *Written by the assistant from the run's numbers; the platform's Smart
-  Summary was not available ({reason}).*
+1. Say why, from the error message or `errorMessage`:
+   - AI Test Builder turned off: "an admin has turned AI off for this organisation".
+   - No key or the key was rejected: "Smart Summary isn't set up - an admin can add a key under
+     Settings > AI Provider".
+   - Daily limit reached: "the organisation's daily AI limit is reached; it resets tomorrow".
+2. Give the run's numbers only, from `list_performance_runs`: status, start time and duration,
+   requests, errors and error %, mean / p95 / p99 response time, SLA verdict ("No SLA set" for
+   NOT_EVALUATED), and `failureReason` for a FAILED run.
 
 ## Rules
 - Never expose raw ids. Use the bot and run names.
