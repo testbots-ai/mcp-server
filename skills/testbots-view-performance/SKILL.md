@@ -1,6 +1,6 @@
 ---
 name: testbots-view-performance
-description: Read the performance and ROI metrics from a run and say what they show
+description: Read the duration and ROI metrics from a UI TestBot run (not Performance Bot load tests)
 tools:
   - mcp__testbots-mcp-server__get_context
   - mcp__testbots-mcp-server__list_recent_runs
@@ -8,7 +8,10 @@ tools:
 ---
 
 ## When to use this skill
-The user wants to see performance metrics or ROI data from a test run.
+The user wants duration or ROI/time-saved figures from a UI TestBot run.
+
+Not for Performance Bots (JMeter load tests). Their runs and Smart Summary are
+`testbots-performance-bot`.
 
 ## Workflow
 

@@ -7,6 +7,7 @@ EXPECTED_SKILLS = {
     "testbots-gen-from-requirements",
     "testbots-gen-from-url",
     "testbots-heal-locators",
+    "testbots-performance-bot",
     "testbots-run-bot",
     "testbots-schedule-bot",
     "testbots-test-architecture",

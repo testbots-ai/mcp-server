@@ -229,7 +229,9 @@ def test_core_meaningfully_reduces_the_wire_payload():
     ))
 
     full_chars, core_chars = size(TOOLS), size(kept)
-    assert core_chars < full_chars * 0.6, (
-        f"core is {core_chars} chars vs full {full_chars} — under a 40% saving it is not "
+    # 0.62, not 0.6: the performance group joined core with testbots-performance-bot (v5.19.0),
+    # because every bundled skill must work under core. Raise again only for the same reason.
+    assert core_chars < full_chars * 0.62, (
+        f"core is {core_chars} chars vs full {full_chars} — under a 38% saving it is not "
         f"earning the extra code path."
     )

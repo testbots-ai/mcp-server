@@ -814,9 +814,12 @@ TOOLS = [
     Tool(name="test_workflow", description="Run a one-off chained API workflow test (does not need to be saved first).", inputSchema={"type": "object", "properties": {"name": {"type": "string"}, "api_requests": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}, "method": {"type": "string"}, "name": {"type": "string"}, "url": {"type": "string"}, "headers": {"type": "object"}, "body": {}}}, "description": "Max 50 requests"}, "description": {"type": "string"}, "load_ratio": {"type": "number"}}, "required": ["name", "api_requests"]}),
     Tool(name="list_performance_bots", description="List JMeter-backed load/performance bots only. NOT the answer to 'show me my bots' — that is list_bots; these are a separate mtaf-core product surface and this list is empty in most projects.", inputSchema={"type": "object", "properties": {}}),
     Tool(name="get_performance_bot", description="Get full details of a performance bot by ID.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
-    Tool(name="run_performance_bot", description="Run an existing performance bot by ID. Runs async in the background (can take hours) — returns a metrics ID immediately for polling via get_performance_results.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
+    Tool(name="run_performance_bot", description="Run an existing performance bot by ID. Runs async in the background (can take hours) — returns a metrics ID immediately for polling via get_performance_results; once it ends, get_performance_smart_summary has the AI summary.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
     Tool(name="stop_performance_bot", description="Stop a running performance bot.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}}, "required": ["bot_id"]}),
     Tool(name="get_performance_results", description="Poll a running JMeter LOAD test (throughput, response times, error rate) by the metrics ID from run_performance_bot. Not for UI executions — those are get_execution_report / get_performance_report, which take an execution_id.", inputSchema={"type": "object", "properties": {"metrics_id": {"type": "string"}, "polling": {"type": "boolean", "default": True}}, "required": ["metrics_id"]}),
+    Tool(name="list_performance_runs", description="Past runs of one performance bot, newest first, with status, counts, percentiles and SLA verdict. Finds a run not started in this chat; each id is the metrics_id for the results and smart-summary tools.", inputSchema={"type": "object", "properties": {"bot_id": {"type": "string"}, "page": {"type": "integer", "default": 0}, "size": {"type": "integer", "default": 10, "description": "Runs per page, max 50"}, "include_endpoints": {"type": "boolean", "default": False, "description": "Add per-endpoint stats, worst first"}}, "required": ["bot_id"]}),
+    Tool(name="get_performance_smart_summary", description="AI Smart Summary of a finished performance run: verdict, findings, SLA, bottlenecks, errors, comparison, recommendations. status PENDING/RUNNING: poll again; NOT_AVAILABLE: none yet; NOT_CONFIGURED: no AI key; QUOTA_EXCEEDED: daily AI cap hit.", inputSchema={"type": "object", "properties": {"metrics_id": {"type": "string", "description": "Run id from run_performance_bot or list_performance_runs"}}, "required": ["metrics_id"]}),
+    Tool(name="regenerate_performance_smart_summary", description="Rewrite a finished run's Smart Summary. Spends AI credits: only when the user asks or none exists/FAILED. Returns PENDING; poll get_performance_smart_summary.", inputSchema={"type": "object", "properties": {"metrics_id": {"type": "string"}}, "required": ["metrics_id"]}),
     Tool(name="list_vault_secrets", description="List secrets in the API/performance-testing vault (mtaf-core), for API requests and workflows. Metadata only — never decrypted values. The vault for UI test-script credentials is a DIFFERENT store: list_config_vault_secrets.", inputSchema={"type": "object", "properties": {}}),
 
     # Local execution agent — for TestBots configured to run on the user's own machine
@@ -1980,6 +1983,15 @@ async def _dispatch(name: str, args: dict, clients: ClientBundle, is_hosted: boo
         return await clients.managed_testing.stop_performance_bot(args["bot_id"])
     if name == "get_performance_results":
         return await clients.managed_testing.get_performance_results(args["metrics_id"], args.get("polling", True))
+    if name == "list_performance_runs":
+        size = max(1, min(int(args.get("size", 10)), 50))
+        return await clients.managed_testing.list_performance_runs(
+            args["bot_id"], int(args.get("page", 0)), size, bool(args.get("include_endpoints", False))
+        )
+    if name == "get_performance_smart_summary":
+        return await clients.test_mgmt.get_performance_smart_summary(args["metrics_id"])
+    if name == "regenerate_performance_smart_summary":
+        return await clients.test_mgmt.regenerate_performance_smart_summary(args["metrics_id"])
     if name == "list_vault_secrets":
         return await clients.managed_testing.list_vault_secrets()
 

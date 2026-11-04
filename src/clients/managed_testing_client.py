@@ -1,3 +1,5 @@
+import re
+
 from src.clients.base_client import BaseAhqClient
 from src.config.ahq_services import MANAGED_TEST_SVC
 
@@ -5,6 +7,41 @@ from src.config.ahq_services import MANAGED_TEST_SVC
 def _unwrap(result):
     """mtaf-core list responses wrap items in a `data` field (not `content` like the UI-test services)."""
     return result.get("data", result) if isinstance(result, dict) else result
+
+
+_PERF_RUN_FIELDS = (
+    "id", "name", "status", "created", "updated", "overallStatus", "slaVerdict",
+    "failureReason", "skippedRequests", "estimatedVirtualUsers", "estimatedDurationMinutes",
+)
+
+_MAX_ENDPOINTS = 20
+
+
+def _seconds(duration) -> float:
+    """A java.time.Duration as Jackson writes it: numeric seconds, or ISO-8601 like PT0.25S."""
+    if isinstance(duration, (int, float)):
+        return float(duration)
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?", str(duration or ""))
+    if not match:
+        return 0.0
+    h, m, sec = match.groups()
+    return int(h or 0) * 3600 + int(m or 0) * 60 + float(sec or 0)
+
+
+def _flatten_endpoints(workflow_metrics) -> list:
+    endpoints = []
+    for wf in workflow_metrics or []:
+        if not isinstance(wf, dict):
+            continue
+        for req in wf.get("apiRequestMetrics") or []:
+            if isinstance(req, dict):
+                endpoints.append({
+                    "workflow": wf.get("name"),
+                    "name": req.get("name"),
+                    **(req.get("overallStatus") or {}),
+                })
+    endpoints.sort(key=lambda e: (e.get("errorCount") or 0, _seconds(e.get("perc95ResponseTime"))), reverse=True)
+    return endpoints[:_MAX_ENDPOINTS]
 
 
 class ManagedTestingClient(BaseAhqClient):
@@ -128,6 +165,29 @@ class ManagedTestingClient(BaseAhqClient):
 
     async def stop_performance_bot(self, bot_id: str) -> dict:
         return await self.post(f"/rest/api/performance-bots/stop/{bot_id}")
+
+    async def list_performance_runs(
+        self, bot_id: str, page: int = 0, size: int = 10, include_endpoints: bool = False
+    ) -> list:
+        # Newest first (sorted by `created` server-side). workflowMetrics nests per-request stats
+        # under each workflow; it is flattened into `endpoints` only on request, worst first and
+        # capped, so a plain history page stays small.
+        result = _unwrap(await self.get(
+            f"/rest/api/performance-metrics/paged/list/{bot_id}", params={"page": page, "size": size}
+        ))
+        runs = result.get("content", result) if isinstance(result, dict) else result
+        if not isinstance(runs, list):
+            return runs
+        slim_runs = []
+        for r in runs:
+            if not isinstance(r, dict):
+                slim_runs.append(r)
+                continue
+            slim = {k: r[k] for k in _PERF_RUN_FIELDS if r.get(k) is not None}
+            if include_endpoints:
+                slim["endpoints"] = _flatten_endpoints(r.get("workflowMetrics"))
+            slim_runs.append(slim)
+        return slim_runs
 
     async def get_performance_results(self, metrics_id: str, polling: bool = True) -> dict:
         return await self.get(

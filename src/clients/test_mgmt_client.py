@@ -1,6 +1,6 @@
 import asyncio
 
-from src.clients.base_client import BaseAhqClient
+from src.clients.base_client import AhqApiError, BaseAhqClient
 from src.config.ahq_services import TEST_MGMT_SVC
 
 # The platform's step titles rarely use the word a caller reaches for first. Searching
@@ -1011,3 +1011,23 @@ class TestMgmtClient(BaseAhqClient):
     async def convert_text_to_cron(self, text: str) -> dict:
         """Human-language -> cron expression, e.g. 'every day at 9am' -> '0 9 * * *'."""
         return await self.post("/rest/api/schedulers/convert-to-cron", json={"text": text, "locale": "en"})
+
+    # --- Performance Bot Smart Summary ---
+    # The AI summary of a performance run is written by this service, not by mtaf-core: mtaf-core
+    # pushes the run's evidence here when the run ends, and the summary is stored per metrics id.
+    async def get_performance_smart_summary(self, metrics_id: str) -> dict:
+        try:
+            return await self.get(
+                "/rest/api/ai-builder/performance-summaries",
+                params={"performanceMetricsId": metrics_id},
+            )
+        except AhqApiError as e:
+            # 404 is the normal answer for a run still in progress or one that ended before the
+            # feature existed. Returned as data so the caller can offer to regenerate it.
+            if e.status_code == 404:
+                return {"status": "NOT_AVAILABLE", "message": "No smart summary for this run yet."}
+            raise
+
+    async def regenerate_performance_smart_summary(self, metrics_id: str) -> dict:
+        # Spends the organisation's AI credits. Returns PENDING at once; poll the get call.
+        return await self.post(f"/rest/api/ai-builder/performance-summaries/{metrics_id}/regenerate")

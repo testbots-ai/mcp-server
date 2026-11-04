@@ -175,6 +175,9 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "run_performance_bot",
         "stop_performance_bot",
         "get_performance_results",
+        "list_performance_runs",
+        "get_performance_smart_summary",
+        "regenerate_performance_smart_summary",
     ),
     "contracts": (
         "list_consumers",
@@ -212,13 +215,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 # `core` is not a taste judgment about which tools are "important" — it is defined as the set
-# that keeps all 9 bundled skills working, plus the read/navigate tools a human needs around
+# that keeps all 10 bundled skills working, plus the read/navigate tools a human needs around
 # them. tests/test_tool_groups.py asserts the skill half of that from the skills' own declared
 # `tools:` frontmatter, so a skill that grows a new dependency fails CI instead of half-running
 # against a client that can't see the tool.
 #
 # Whole groups where the skills need most of the group anyway; explicit names where they don't.
-_CORE_GROUPS = ("context", "discovery", "healing", "planning", "scheduling", "reporting")
+_CORE_GROUPS = ("context", "discovery", "healing", "planning", "scheduling", "reporting", "performance")
 
 _CORE_EXTRA = (
     # authoring — the create/read path. Deliberately omits delete_test_script and the
