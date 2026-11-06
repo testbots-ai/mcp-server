@@ -99,7 +99,9 @@ don't reintroduce a "where should this go" question to the user.
    `requirement_id/heading → module/workflow (if step 5 ran) → test case name(s) → priority`. Mark
    any requirement a count cap excluded, so the omission is visible, not silent. Show this to the
    user for confirmation before writing scripts, since requirements → test case mapping is not
-   always 1:1.
+   always 1:1. In the same message, when there are 2 or more test cases, ask as its own question
+   whether they want one script per test case or one script covering them all, and wait for the
+   answer — do not pick a default and offer to change it afterwards.
 
 9. For each concrete UI action a test case needs, call `search_step_templates` to get the real
    `templateId` AND `templateTitle` — never a fixed list you can assume. Single-word searches work

@@ -606,7 +606,7 @@ TOOLS = [
     Tool(
         name="create_test_script",
         description=(
-            "Create a test script in TestBots. LOGIN: wait 10s after the submit. No password or vault secret? Type UPDATE_PASSWORD, tell the user to update it, and pass on any password_warning. Each step's templateId MUST come from "
+            "Create a test script in TestBots. SEVERAL TEST CASES (2+): before the first create, ask the user as its own question whether they want one script per test case or one script covering them all, and wait for the answer - do not pick one and offer to change it later; restructuring means recreating every script. LOGIN: wait 10s after the submit. No password or vault secret? Type UPDATE_PASSWORD, tell the user to update it, and pass on any password_warning. Each step's templateId MUST come from "
             "list_step_templates/search_step_templates — never invent one. Call get_step_template "
             "on the chosen template first to see which parameter keys it actually uses. "
             "For built-in templates (templateId like 'template-id-N'), also copy that template's "

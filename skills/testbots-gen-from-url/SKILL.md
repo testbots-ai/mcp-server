@@ -145,10 +145,11 @@ The user has a deployed web application and wants test scripts generated automat
   running the script, rather than finding it one failed run at a time.
 - Never create a script with 0 steps
 - Script names must be unique — append " (2)", " (3)" if duplicates arise
-- **Agree the granularity before generating at scale.** One script per test case and one script
+- **Ask the granularity before creating any script.** One script per test case and one script
   bundling several related cases are both legitimate, and the right answer depends on how the user
-  intends to run and maintain them. When a run would produce more than a handful of scripts, state
-  the split you are about to make and confirm it — restructuring afterwards means recreating every
+  intends to run and maintain them. Whenever there are 2 or more test cases, ask the user which
+  they want as its own question and wait for the answer before the first `create_test_script` —
+  do not pick a default and offer to change it afterwards. Restructuring means recreating every
   script, since a script's steps are its identity
 - Locators from a credentialed crawl: `crawl_url` captures the sign-in page BEFORE authenticating
   and the authenticated pages after, so one call covers both. If a login form's fields are missing
