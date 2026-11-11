@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page
@@ -39,6 +40,15 @@ NAV_SKIP = re.compile(r"(?i)\b(log\s?out|sign\s?out|delete|remove|archive|reset|
 MENU_ITEM_SELECTOR = '[role="menuitem"]'
 MAX_NAV_CLICKS = 25  # per crawl
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
+PAGE_LOAD_TIMEOUT = 30_000  # ms per try: domcontentloaded, the one load a page must reach
+# A crawled page is captured once its controls stop changing and it is waiting on no API call, not
+# once the network goes idle: analytics, video and long-polls keep some sites from ever going idle,
+# which spent the whole idle timeout on every page while the controls had long been drawn.
+SETTLE_CAP = 10_000  # ms: the most a page is given to draw its controls
+SETTLE_QUIET_MS = 1_500  # controls unchanged and no API call in flight for this long = drawn
+SETTLE_POLL_MS = 250
+LONG_LIVED_REQUEST_MS = 5_000  # an API call open longer than this is a long-poll, not a page load
+MIN_PAGE_TIME_S = 10  # a page is not started with less of the time budget left than this
 # A page load that fails the way a busy or flaky site fails - a timeout, a reset connection, a
 # crashed tab, a gateway error - is tried again, with a growing pause, before it counts as failed.
 GOTO_ATTEMPTS = 3
@@ -48,6 +58,7 @@ _TRANSIENT_ERROR = re.compile(
     r"Timeout|net::ERR_(?!NAME_NOT_RESOLVED|CERT_|INVALID_|ABORTED|BLOCKED)|ECONNRESET|socket hang up|Target (page, context or browser )?(has been )?closed"
     r"|Navigation .*interrupted|frame was detached|Page crashed", re.IGNORECASE)
 OVERLAY_WAIT_STEPS = 6  # x 500 ms: how long a page is watched for a panel that opens after load
+OVERLAY_WATCH_FROM_LOAD_MS = 4_000  # a crawled page: watched until this long after it loaded
 LOGIN_FORM_RENDER_TIMEOUT = 10_000  # ms: how long a credentialed crawl waits for the sign-in form to render
 
 # Marks the sign-in form for the locators below. A password field counts only when an email or
@@ -98,11 +109,14 @@ def _is_transient(error: Exception) -> bool:
     return isinstance(error, _GotoFailed) or bool(_TRANSIENT_ERROR.search(f"{type(error).__name__} {error}"))
 
 
-async def _goto(page, url: str, timeout: int = NETWORK_IDLE_TIMEOUT + 20_000):
-    """page.goto, tried again on a failure a retry can fix. Any other failure is raised at once."""
+async def _goto(page, url: str, timeout: int = PAGE_LOAD_TIMEOUT, deadline: float = None):
+    """page.goto, tried again on a failure a retry can fix. Any other failure is raised at once.
+    With a deadline (event-loop time), no retry is started past it."""
     last = None
     for attempt in range(GOTO_ATTEMPTS):
         if attempt:
+            if deadline is not None and asyncio.get_running_loop().time() > deadline:
+                break
             await asyncio.sleep(GOTO_RETRY_PAUSE_MS * attempt / 1000)
         try:
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -123,6 +137,52 @@ async def _settle(page) -> None:
         await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
     except Exception:
         pass
+
+
+class _PendingRequests:
+    """The fetch/XHR calls a page has in flight - what an app is waiting on before it draws its
+    controls. Attach before the page loads so its first calls are seen."""
+
+    def __init__(self, page):
+        self._started = {}
+        page.on("request", self._on_start)
+        page.on("requestfinished", self._on_end)
+        page.on("requestfailed", self._on_end)
+
+    def _on_start(self, request) -> None:
+        if request.resource_type in ("fetch", "xhr"):
+            self._started[request] = time.monotonic()
+
+    def _on_end(self, request) -> None:
+        self._started.pop(request, None)
+
+    def busy(self) -> bool:
+        now = time.monotonic()
+        return any(now - started < LONG_LIVED_REQUEST_MS / 1000 for started in self._started.values())
+
+
+_VISIBLE_CONTROLS_JS = """() => [...document.querySelectorAll(
+    'a[href], button, input, select, textarea, [role=button], [role=link], [role=menuitem], [role=tab]')]
+  .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }).length"""
+
+
+async def _wait_for_content(page, pending: _PendingRequests, cap_ms: int = SETTLE_CAP) -> None:
+    """Until the page's visible controls have stopped changing and no API call is in flight, or
+    cap_ms has passed; never fails. A page that has drawn no control yet is still loading."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + cap_ms / 1000
+    last, quiet_since = None, loop.time()
+    while loop.time() < end:
+        try:
+            count = await page.evaluate(_VISIBLE_CONTROLS_JS)
+        except Exception:
+            count = None  # navigated mid-read; the next poll reads the new document
+        now = loop.time()
+        if count != last or pending.busy():
+            last, quiet_since = count, now
+        elif count and now - quiet_since >= SETTLE_QUIET_MS / 1000:
+            return
+        await asyncio.sleep(SETTLE_POLL_MS / 1000)
 
 
 async def _find_login_form(page) -> bool:
@@ -384,7 +444,15 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
 
 async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAGES,
                     hosted: bool = False, follow_links: bool = True, open_by_clicking: list = None,
-                    login_url: str = None, open_each: list = None) -> dict:
+                    login_url: str = None, open_each: list = None, time_budget_s: int = None) -> dict:
+    """time_budget_s: how long the caller waits for this crawl, counted from now - time spent
+    waiting for a free browser included. The crawl returns what it captured inside it rather than
+    run past it, so a caller that gives up at its own deadline never loses every page. Capped at the
+    server's own crawl budget."""
+    # A caller's budget starts now, before the semaphore: time queued behind other crawls is time it
+    # is waiting too. Without one, the server's budget starts once a browser is free, as it always has.
+    caller_deadline = (asyncio.get_running_loop().time() + _budget_seconds(time_budget_s)
+                       if time_budget_s else None)
     max_pages = max(1, min(int(max_pages or MAX_PAGES), MAX_PAGES_LIMIT))
     if hosted:
         # SSRF guard (Slice 9j): a hosted crawl runs INSIDE the cluster, so a crafted URL
@@ -397,9 +465,14 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
             return {"error": blocked}
 
     async with _CRAWL_SEMAPHORE:
+        deadline = caller_deadline or asyncio.get_running_loop().time() + settings.ahq_mcp_crawl_time_budget_s
+        if asyncio.get_running_loop().time() > deadline - MIN_PAGE_TIME_S:
+            return {"error": "Every crawl browser was busy for the whole time this crawl was given, so no page "
+                             "was opened.",
+                    "transient": True, "retry_note": "Try the same crawl again in a minute."}
         try:
             return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url,
-                                open_each)
+                                open_each, deadline)
         except _GotoFailed as failed:
             # The sign-in page itself never loaded, so nothing behind it could be reached.
             return {"error": str(failed), "transient": True,
@@ -424,7 +497,26 @@ _OPEN_OVERLAYS_JS = r"""() => {
 }"""
 
 
-async def _dismiss_overlays(page) -> list:
+def _overlay_watch_left(loaded_at: float) -> int:
+    """What is left of the overlay watch, counted from the page load: an overlay opens a moment
+    after the load (one measured at 2.3 s), and the wait for the controls already covered part of it.
+    The window ends no earlier after the load than the fixed one-second pause plus the full watch did."""
+    elapsed_ms = int((asyncio.get_running_loop().time() - loaded_at) * 1000)
+    return max(0, OVERLAY_WATCH_FROM_LOAD_MS - elapsed_ms)
+
+
+def _budget_seconds(time_budget_s) -> int:
+    """The caller's budget, within [MIN_PAGE_TIME_S, the server's crawl budget]; the server's own
+    budget when none (or nonsense) is given."""
+    ceiling = settings.ahq_mcp_crawl_time_budget_s
+    try:
+        asked = int(time_budget_s)
+    except (TypeError, ValueError):
+        return ceiling
+    return max(MIN_PAGE_TIME_S, min(asked, ceiling)) if asked > 0 else ceiling
+
+
+async def _dismiss_overlays(page, watch_ms: int = OVERLAY_WAIT_STEPS * 500) -> list:
     """
     Closes whatever is open over the page on arrival and reports how, so a test of the page can do
     the same first. A help panel that opens on a first visit covered the sidebar of a signed-in
@@ -433,11 +525,13 @@ async def _dismiss_overlays(page) -> list:
     """
     # These typically open a moment after the page has loaded (one measured at 2.3 s), later than
     # the capture would otherwise start, so watch for one briefly before concluding there is none.
+    # A caller that has already waited out part of that window since the load passes what is left;
+    # the page is always checked at least once.
     overlays = []
     try:
-        for _ in range(OVERLAY_WAIT_STEPS):
+        for step in range(max(1, -(-watch_ms // 500))):
             overlays = await page.evaluate(_OPEN_OVERLAYS_JS)
-            if overlays:
+            if overlays or (step + 1) * 500 >= watch_ms:
                 break
             await page.wait_for_timeout(500)
     except Exception:
@@ -465,7 +559,8 @@ async def _dismiss_overlays(page) -> list:
     return found
 
 
-async def _capture_page(page, final_url: str = None, opened: bool = False) -> dict:
+async def _capture_page(page, final_url: str = None, opened: bool = False,
+                        overlay_watch_ms: int = OVERLAY_WAIT_STEPS * 500) -> dict:
     """One page's locator harvest, in the shape the tool returns per page.
 
     `final_url` reports where we actually landed rather than where we asked to go: add_locators
@@ -474,7 +569,7 @@ async def _capture_page(page, final_url: str = None, opened: bool = False) -> di
     """
     # A page opened by clicking holds the dialog or menu that was asked for: closing overlays would
     # close it, and expanding navigation would click away from it.
-    overlays = [] if opened else await _dismiss_overlays(page)
+    overlays = [] if opened else await _dismiss_overlays(page, overlay_watch_ms)
     locators = await _extract_locators(page)
     # Taken before validation, which replaces each raw position with the chosen locator.
     seen = {(loc.get("xpath"), loc.get("text")) for loc in locators}
@@ -650,7 +745,8 @@ async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) ->
     # itself until it is closed.
     await page.keyboard.press("Escape")
     await page.wait_for_timeout(300)
-    await _dismiss_overlays(page)
+    # The page was captured already, so anything that opens on arrival is open by now.
+    await _dismiss_overlays(page, watch_ms=0)
 
     def out_of_time() -> bool:
         return deadline is not None and asyncio.get_running_loop().time() > deadline
@@ -719,14 +815,22 @@ def _opener_label(clicks: list) -> str:
 
 
 async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
-                 open_by_clicking: list = None, login_url: str = None, open_each: list = None) -> dict:
+                 open_by_clicking: list = None, login_url: str = None, open_each: list = None,
+                 deadline: float = None) -> dict:
     openers = _openers(open_by_clicking, open_each)
     opener_pending = bool(openers)
     unopened: list = []
     nav_tried: set = set()
     retried: set = set()
     not_crawled: list = []
-    deadline = asyncio.get_running_loop().time() + settings.ahq_mcp_crawl_time_budget_s
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + settings.ahq_mcp_crawl_time_budget_s
+    budget_s = round(deadline - loop.time())
+
+    def time_left_ms() -> int:
+        return int((deadline - loop.time()) * 1000)
+
     base_domain = urlparse(url).netloc
     visited: set[str] = set()
     pages_data = []
@@ -879,9 +983,11 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             visited.add(_dedup_key(pre_auth_page["url"]))
 
         while queue and len(visited) < max_pages:
-            if asyncio.get_running_loop().time() > deadline:
+            if time_left_ms() <= 0 or (pages_data and time_left_ms() < MIN_PAGE_TIME_S * 1000):
                 # Stopped rather than overrun the caller's own timeout, which would lose every page
-                # already captured. What is left is reported, for a second call to pick up.
+                # already captured. What is left is reported, for a second call to pick up. A page
+                # is not started with too little time left to finish it - unless none is captured
+                # yet, since one page is worth more than none.
                 not_crawled = [u for u in queue if _dedup_key(u) not in visited]
                 break
             current_url = queue.pop(0)
@@ -897,15 +1003,13 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
 
             try:
                 page = await context.new_page()
-                # domcontentloaded is the hard requirement — networkidle is best-effort only.
-                # A page that keeps a persistent connection open (websocket/long-polling) never
-                # goes network-idle, which would otherwise block the crawl on that page forever.
-                await _goto(page, current_url)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1_000)
+                pending = _PendingRequests(page)
+                # domcontentloaded is the hard requirement; the wait for the controls is best-effort
+                # and never fails the page. Both are held inside what is left of the time budget.
+                await _goto(page, current_url, timeout=max(5_000, min(PAGE_LOAD_TIMEOUT, time_left_ms())),
+                            deadline=deadline)
+                loaded_at = loop.time()
+                await _wait_for_content(page, pending, max(1_000, min(SETTLE_CAP, time_left_ms())))
 
                 # Report where we actually landed, not where we asked to go: add_locators upserts
                 # by page URL, so a redirect (http->https, "/" -> "/home", auth bounce) would
@@ -926,18 +1030,17 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                                 unopened += [_opener_label(c) for c in openers[index:]]
                                 break
                             try:
-                                await _goto(page, current_url)
+                                await _goto(page, current_url,
+                                            timeout=max(5_000, min(PAGE_LOAD_TIMEOUT, time_left_ms())),
+                                            deadline=deadline)
                             except Exception:
                                 # Only this entry is lost: re-raising would retry the whole page and
                                 # report the menus already captured twice.
                                 unopened.append(_opener_label(clicks))
                                 continue
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-                            except Exception:
-                                pass
-                            await page.wait_for_timeout(1_000)
-                        overlays = await _dismiss_overlays(page)
+                            loaded_at = loop.time()
+                            await _wait_for_content(page, pending, max(1_000, min(SETTLE_CAP, time_left_ms())))
+                        overlays = await _dismiss_overlays(page, _overlay_watch_left(loaded_at))
                         opening = await _open_by_clicking(page, clicks, hosted)
                         # A click can move to another page - "Test Bots" in a sidebar does. The elements
                         # belong to where the clicks ended, so that is the page they are reported under.
@@ -950,7 +1053,8 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                                                         "first with the closes_with step, right after the page loads.")
                         pages_data.append(captured)
                 else:
-                    pages_data.append(await _capture_page(page, final_url))
+                    pages_data.append(await _capture_page(page, final_url,
+                                                          overlay_watch_ms=_overlay_watch_left(loaded_at)))
 
                 # follow_links=False captures the landing page only - enough for a test of its own
                 # menus, without spending a browser on every page they lead to.
@@ -999,13 +1103,13 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
     }
     if not_crawled:
         result["not_crawled"] = not_crawled
-        result["not_crawled_note"] = (f"The crawl stopped at its {settings.ahq_mcp_crawl_time_budget_s}s time limit "
+        result["not_crawled_note"] = (f"The crawl stopped at its {budget_s}s time limit "
                                       "with these pages still to visit. Crawl the ones a test needs directly, "
                                       "with follow_links false.")
     if unopened:
         result["could_not_open"] = unopened
         result["open_note"] = ("These were not opened - the page did not reload for them, or the crawl reached "
-                               f"its {settings.ahq_mcp_crawl_time_budget_s}s time limit. Crawl them in a second "
+                               f"its {budget_s}s time limit. Crawl them in a second "
                                "call with open_each set to just these.")
     if opener_pending:
         # url never got its clicks - usually because it is the sign-in page, captured signed out and
