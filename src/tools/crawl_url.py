@@ -391,12 +391,69 @@ async def _count_matches(page: Page, selector: str, *, is_xpath: bool = False) -
         return 0
 
 
+# Counts every candidate selector in one round trip. Playwright's own count() is one browser call per
+# selector: a large storefront home page (~360 elements, several candidates each) spent ~100 s on
+# them and the crawl's whole budget on its first page, so the listing pages behind it were never
+# reached. CSS is counted in the document and every open shadow root, as Playwright's CSS reaches
+# into them (XPath does not, in either). Null for a selector the browser's own engines can't run (a
+# Playwright-only form), which falls back to count().
+_BATCH_COUNT_JS = """
+(selectors) => {
+  const roots = [document];
+  for (let i = 0; i < roots.length; i++) {
+    roots[i].querySelectorAll('*').forEach(e => { if (e.shadowRoot) roots.push(e.shadowRoot); });
+  }
+  return selectors.map(([value, isXpath]) => {
+    try {
+      if (isXpath) {
+        return document.evaluate(value, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null).snapshotLength;
+      }
+      let n = 0;
+      for (const root of roots) { n += root.querySelectorAll(value).length; }
+      return n;
+    } catch (e) {
+      return null;
+    }
+  });
+}
+"""
+
+
+async def _batch_counts(page: Page, locators: list[dict]) -> dict:
+    """(selector, is_xpath) -> match count for every candidate, from one browser call; {} if it can't."""
+    keys = list(dict.fromkeys((c["locatorValue"], c["locateBy"] == "xpath")
+                              for loc in locators for c in (loc.get("candidates") or [])))
+    if not keys:
+        return {}
+    try:
+        counts = await page.evaluate(_BATCH_COUNT_JS, [list(k) for k in keys])
+    except Exception:
+        return {}
+    if counts is None:
+        return {}
+    return {k: c for k, c in zip(keys, counts) if c is not None}
+
+
+# Validated per chunk when a page has a deadline, so the check stops when the page's time is spent.
+VALIDATION_CHUNK = 10
+
+
+def _validation_priority(loc: dict, label_counts: dict) -> tuple:
+    """Fields, then buttons, then navigation, then other links; a label repeated across the page
+    (a product grid's "+7 Shades" on every card) last, since one of its copies serves a test."""
+    tag = (loc.get("tag") or "").lower()
+    kind = 0 if tag in ("input", "select", "textarea") else 1 if tag == "button" or loc.get("role") == "button" else \
+        2 if any(region in (loc.get("xpath") or "").lower() for region in ("/nav", "/header", "/aside")) else 3
+    label = (loc.get("text") or loc.get("ariaLabel") or "").strip().lower()
+    return (1 if label and label_counts.get(label, 0) > 3 else 0, kind)
+
+
 # What a locator rests on, from most to least likely to survive a release.
 _FRAGILE_BASES = {"class", "position"}
 MAX_STRATEGIES = 4
 
 
-async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
+async def _validate_locators(page: Page, locators: list[dict], deadline: float = None) -> list[dict]:
     """Keep locators that resolve to EXACTLY ONE element, with every candidate that does, ranked.
 
     Matching at all is not the bar. The extractor falls back to a bare tag selector whenever an
@@ -410,13 +467,35 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
     `fragile`, so whoever saves it knows it is the one most likely to need healing.
     """
     valid = []
+    if deadline is None:
+        counts = await _batch_counts(page, locators)
+    else:
+        # A large page (a storefront home: ~400 elements, most behind text XPaths that each scan the
+        # whole DOM) took ~100 s here, longer than the crawl's budget, so no page after it was ever
+        # reached. Most useful elements first, in chunks, until this page's share of the budget is spent.
+        label_counts = {}
+        for loc in locators:
+            label = (loc.get("text") or loc.get("ariaLabel") or "").strip().lower()
+            if label:
+                label_counts[label] = label_counts.get(label, 0) + 1
+        page_order = {id(loc): i for i, loc in enumerate(locators)}
+        locators = sorted(locators, key=lambda loc: _validation_priority(loc, label_counts))
+        loop = asyncio.get_running_loop()
+        counts, checked = {}, 0
+        while checked < len(locators) and loop.time() < deadline:
+            counts.update(await _batch_counts(page, locators[checked:checked + VALIDATION_CHUNK]))
+            checked += VALIDATION_CHUNK
+        locators = sorted(locators[:checked], key=lambda loc: page_order[id(loc)])
     for loc in locators:
         unique = []
         for candidate in loc.pop("candidates", None) or []:
             is_xpath = candidate["locateBy"] == "xpath"
             if any(c["locatorValue"] == candidate["locatorValue"] for c in unique):
                 continue
-            if await _count_matches(page, candidate["locatorValue"], is_xpath=is_xpath) == 1:
+            count = counts.get((candidate["locatorValue"], is_xpath))
+            if count is None:
+                count = await _count_matches(page, candidate["locatorValue"], is_xpath=is_xpath)
+            if count == 1:
                 unique.append(candidate)
                 if len(unique) >= MAX_STRATEGIES:
                     break
@@ -444,7 +523,8 @@ async def _validate_locators(page: Page, locators: list[dict]) -> list[dict]:
 
 async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAGES,
                     hosted: bool = False, follow_links: bool = True, open_by_clicking: list = None,
-                    login_url: str = None, open_each: list = None, time_budget_s: int = None) -> dict:
+                    login_url: str = None, open_each: list = None, time_budget_s: int = None,
+                    prefer_paths: list = None) -> dict:
     """time_budget_s: how long the caller waits for this crawl, counted from now - time spent
     waiting for a free browser included. The crawl returns what it captured inside it rather than
     run past it, so a caller that gives up at its own deadline never loses every page. Capped at the
@@ -472,7 +552,8 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
                     "transient": True, "retry_note": "Try the same crawl again in a minute."}
         try:
             return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url,
-                                open_each, deadline)
+                                open_each, deadline, prefer_paths,
+                                share_time=bool(time_budget_s or prefer_paths))
         except _GotoFailed as failed:
             # The sign-in page itself never loaded, so nothing behind it could be reached.
             return {"error": str(failed), "transient": True,
@@ -560,7 +641,7 @@ async def _dismiss_overlays(page, watch_ms: int = OVERLAY_WAIT_STEPS * 500) -> l
 
 
 async def _capture_page(page, final_url: str = None, opened: bool = False,
-                        overlay_watch_ms: int = OVERLAY_WAIT_STEPS * 500) -> dict:
+                        overlay_watch_ms: int = OVERLAY_WAIT_STEPS * 500, deadline: float = None) -> dict:
     """One page's locator harvest, in the shape the tool returns per page.
 
     `final_url` reports where we actually landed rather than where we asked to go: add_locators
@@ -573,8 +654,10 @@ async def _capture_page(page, final_url: str = None, opened: bool = False,
     locators = await _extract_locators(page)
     # Taken before validation, which replaces each raw position with the chosen locator.
     seen = {(loc.get("xpath"), loc.get("text")) for loc in locators}
-    valid_locators = await _validate_locators(page, locators)
-    revealed, opened_menus = ({"all": [], "valid": []}, 0) if opened else await _expand_navigation(page, seen)
+    # The deadline only when there is one: a page without one is checked exactly as before.
+    bounded = {} if deadline is None else {"deadline": deadline}
+    valid_locators = await _validate_locators(page, locators, **bounded)
+    revealed, opened_menus = ({"all": [], "valid": []}, 0) if opened else await _expand_navigation(page, seen, **bounded)
     locators += revealed["all"]
     valid_locators += revealed["valid"]
     total, valid = len(locators), len(valid_locators)
@@ -625,7 +708,7 @@ async def _looks_not_found(page, valid_count: int) -> bool:
     return info.get("length", 0) < 400 and any(s in text for s in signals)
 
 
-async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
+async def _expand_navigation(page, seen: set, deadline: float = None) -> tuple[dict, int]:
     """
     Open every collapsed menu group and flyout in the page's navigation, one at a time,
     capturing what each reveals.
@@ -639,7 +722,10 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
     revealed = {"all": [], "valid": []}
     opened = 0
     start_url = page.url
+    loop = asyncio.get_running_loop()
     for _ in range(MAX_MENU_EXPANSIONS):
+        if deadline is not None and loop.time() >= deadline:
+            break
         # A handle, not a locator: a locator re-resolves on every use, so once this element is
         # marked it would quietly point at the NEXT collapsed menu and click that one instead.
         try:
@@ -676,7 +762,7 @@ async def _expand_navigation(page, seen: set) -> tuple[dict, int]:
             if opener:
                 loc["openedBy"] = opener
         revealed["all"] += fresh
-        revealed["valid"] += await _validate_locators(page, fresh)
+        revealed["valid"] += await _validate_locators(page, fresh, **({} if deadline is None else {"deadline": deadline}))
     return revealed, opened
 
 
@@ -794,6 +880,11 @@ def _click_path(entry) -> list:
     return _clean_texts(entry)
 
 
+def _preferred(url: str, prefer_paths: list) -> bool:
+    path = (urlparse(url).path or "/").lower()
+    return any(str(p).lower() in path for p in prefer_paths if p)
+
+
 def _openers(open_by_clicking, open_each) -> list:
     """
     The click paths to capture, one page entry each. open_by_clicking alone is one path, as it has
@@ -816,7 +907,7 @@ def _opener_label(clicks: list) -> str:
 
 async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
                  open_by_clicking: list = None, login_url: str = None, open_each: list = None,
-                 deadline: float = None) -> dict:
+                 deadline: float = None, prefer_paths: list = None, share_time: bool = False) -> dict:
     openers = _openers(open_by_clicking, open_each)
     opener_pending = bool(openers)
     unopened: list = []
@@ -991,6 +1082,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 not_crawled = [u for u in queue if _dedup_key(u) not in visited]
                 break
             current_url = queue.pop(0)
+            page_deadline = deadline
             if _dedup_key(current_url) in visited:
                 continue
             visited.add(_dedup_key(current_url))
@@ -1053,8 +1145,17 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                                                         "first with the closes_with step, right after the page loads.")
                         pages_data.append(captured)
                 else:
+                    # Each page gets its share of the time left, so one huge page can't spend the whole
+                    # budget and leave the pages behind it uncrawled.
+                    # Only for a caller that set a budget or a page order (the TestBots backend); every
+                    # other crawl captures each page in full, as it always has.
+                    page_deadline = deadline
+                    if share_time:
+                        pages_left = max(1, max_pages - len(pages_data))
+                        page_deadline = min(deadline, loop.time() + max(MIN_PAGE_TIME_S, (deadline - loop.time()) / pages_left))
                     pages_data.append(await _capture_page(page, final_url,
-                                                          overlay_watch_ms=_overlay_watch_left(loaded_at)))
+                                                          overlay_watch_ms=_overlay_watch_left(loaded_at),
+                                                          deadline=page_deadline if share_time else None))
 
                 # follow_links=False captures the landing page only - enough for a test of its own
                 # menus, without spending a browser on every page they lead to.
@@ -1062,7 +1163,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 if (follow_links and len(visited) + len(queue) < max_pages
                         and asyncio.get_running_loop().time() < deadline):
                     try:
-                        links += await _pages_behind_nav_buttons(page, nav_tried, deadline)
+                        links += await _pages_behind_nav_buttons(page, nav_tried, page_deadline)
                     except Exception:
                         # The page is already captured; a reload that failed only ends the search.
                         pass
@@ -1075,6 +1176,10 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                         and link not in queue
                     ):
                         queue.append(link)
+                # Pages the caller asked for first (a store's /collections/ listings for a search and
+                # filter test) jump the queue, in the order found; the rest keep theirs.
+                if prefer_paths:
+                    queue.sort(key=lambda u: 0 if _preferred(u, prefer_paths) else 1)
 
                 await page.close()
 
