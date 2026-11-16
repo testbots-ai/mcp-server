@@ -704,10 +704,21 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
             return {"error": "Every crawl browser was busy for the whole time this crawl was given, so no page "
                              "was opened.",
                     "transient": True, "retry_note": "Try the same crawl again in a minute."}
+        progress: dict = {}
+        crawl = _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url,
+                       open_each, deadline, prefer_paths, share_time=bool(time_budget_s or prefer_paths),
+                       progress=progress)
         try:
-            return await _crawl(url, credentials, max_pages, hosted, follow_links, open_by_clicking, login_url,
-                                open_each, deadline, prefer_paths,
-                                share_time=bool(time_budget_s or prefer_paths))
+            if caller_deadline is None:
+                return await crawl
+            # A caller with a budget gets the pages finished in it even when one page hangs: the
+            # crawl only starts a page with time left, but that page can run far past the budget,
+            # and the caller then gave up on the whole crawl - every finished page lost with it.
+            left = max(1.0, deadline - asyncio.get_running_loop().time())
+            try:
+                return await asyncio.wait_for(crawl, timeout=left + OVERRUN_GRACE_S)
+            except asyncio.TimeoutError:
+                return _partial_result(progress, round(left + OVERRUN_GRACE_S))
         except _GotoFailed as failed:
             # The sign-in page itself never loaded, so nothing behind it could be reached.
             return {"error": str(failed), "transient": True,
@@ -738,6 +749,27 @@ def _overlay_watch_left(loaded_at: float) -> int:
     The window ends no earlier after the load than the fixed one-second pause plus the full watch did."""
     elapsed_ms = int((asyncio.get_running_loop().time() - loaded_at) * 1000)
     return max(0, OVERLAY_WATCH_FROM_LOAD_MS - elapsed_ms)
+
+
+OVERRUN_GRACE_S = 20  # s past the caller's budget before a crawl is stopped and its finished pages returned
+
+
+def _partial_result(progress: dict, waited_s: int) -> dict:
+    """The pages a crawl finished before it was stopped past its budget, as a normal result."""
+    pages = progress.get("pages", [])
+    result = {
+        "pages_crawled": len([p for p in pages if "error" not in p]),
+        "total_locators": sum(p.get("total_valid", 0) for p in pages),
+        "pages": pages,
+        "not_crawled_note": (f"The crawl was stopped {waited_s}s in, past its time limit, while a page was "
+                             "still loading; these are the pages it had finished."),
+    }
+    auth = progress.get("auth")
+    if auth is not None:
+        if auth["succeeded"] and auth["detail"] is None:
+            auth["detail"] = "signed in and reached the authenticated area"
+        result["auth"] = auth
+    return result
 
 
 def _budget_seconds(time_budget_s) -> int:
@@ -1096,7 +1128,10 @@ def _opener_label(clicks: list) -> str:
 
 async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, follow_links: bool = True,
                  open_by_clicking: list = None, login_url: str = None, open_each: list = None,
-                 deadline: float = None, prefer_paths: list = None, share_time: bool = False) -> dict:
+                 deadline: float = None, prefer_paths: list = None, share_time: bool = False,
+                 progress: dict = None) -> dict:
+    """progress: filled as the crawl goes - "pages" captured so far and the sign-in's "auth" - so a
+    caller that has to stop the crawl still has every page it finished."""
     openers = _openers(open_by_clicking, open_each)
     opener_pending = bool(openers)
     unopened: list = []
@@ -1113,7 +1148,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
 
     base_domain = urlparse(url).netloc
     visited: set[str] = set()
-    pages_data = []
+    pages_data = progress.setdefault("pages", []) if progress is not None else []
 
     async with async_playwright() as p:
         try:
@@ -1142,6 +1177,8 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             # genuinely has one page — and sends the caller off debugging timing and headless
             # theories instead of the password. Record what happened as we go and report it.
             auth = {"attempted": True, "succeeded": False, "detail": None, "final_url": None}
+            if progress is not None:
+                progress["auth"] = auth
             login_page = await context.new_page()
             # domcontentloaded, then a best-effort settle: a page that keeps a connection open
             # never goes network-idle, and requiring it timed out a sign-in page that a browser
