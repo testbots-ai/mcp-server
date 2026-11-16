@@ -36,9 +36,38 @@ NAV_ITEM_SELECTOR = ", ".join(
 # rest of its buttons are found by, and the app may remember it.
 NAV_SKIP = re.compile(r"(?i)\b(log\s?out|sign\s?out|delete|remove|archive|reset|clear|disconnect|deactivate|uninstall"
                       r"|collapse|expand|toggle|theme|dark mode|light mode|language)\b")
+# A control drawn as a plain element with a pointer cursor - React Native Web renders every button,
+# menu item and card that way, with no <a>, <button> or role. Marked by _MARK_PRESSABLES_JS: the
+# outermost such element carrying readable text, outside any real control.
+PRESSABLE_SELECTOR = "[data-crawl-pressable]"
+# Clicked only to find pages: a pressable named like an action could create, buy or send something.
+PRESSABLE_ACTION_SKIP = re.compile(r"(?i)\b(add|create|new|save|submit|buy|pay|checkout|send|invite|book|confirm"
+                                   r"|approve|reject|cancel|apply|sign\s?up|upgrade|subscribe|edit|update|upload)\b")
+_MARK_PRESSABLES_JS = r"""(MAX) => {
+  document.querySelectorAll('[data-crawl-pressable]').forEach(e => e.removeAttribute('data-crawl-pressable'));
+  const CONTROL = 'a, button, input, select, textarea, label, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [onclick]';
+  const all = document.querySelectorAll('div, span, li, p');
+  if (all.length > 6000) return 0;
+  let marked = 0;
+  for (const el of all) {
+    if (getComputedStyle(el).cursor !== 'pointer') continue;
+    const parent = el.parentElement;
+    if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+    if (el.closest(CONTROL)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    const text = (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length > MAX) continue;
+    el.setAttribute('data-crawl-pressable', '');
+    marked++;
+  }
+  return marked;
+}"""
 # The items of a menu a navigation button opened - often rendered outside the navigation itself.
 MENU_ITEM_SELECTOR = '[role="menuitem"]'
 MAX_NAV_CLICKS = 25  # per crawl
+NAV_STEP_TIMEOUT = 3_000  # ms: how long a navigation click is given to change the address, and Back to return
+NAV_RENDER_WAIT = 700  # ms: for a menu drawn in place, or the start page redrawn after Back
 NETWORK_IDLE_TIMEOUT = 10_000  # ms
 PAGE_LOAD_TIMEOUT = 30_000  # ms per try: domcontentloaded, the one load a page must reach
 # A crawled page is captured once its controls stop changing and it is waiting on no API call, not
@@ -99,6 +128,123 @@ _LOGIN_TRIGGER = r"^\s*(log\s?in|sign\s?in)\s*$"
 
 class _NoLoginForm(Exception):
     """The page has no sign-in form, so there is nothing to submit the credentials to."""
+
+
+class _OtpSignInDone(Exception):
+    """The mobile-number sign-in ran; `auth` already says how it went."""
+
+
+# A mobile-number sign-in: a phone field, a "send code" step, then a one-time code. The crawl can
+# sign in only where the code is known - written in the login's password (a test number whose code
+# never changes), or shown on the page itself, as apps without an SMS gateway yet do in testing
+# ("Testing only - Code: 995471").
+_PHONE_FIELD = ", ".join(f"{sel}:visible" for sel in (
+    'input[type="tel"]', 'input[autocomplete="tel"]', 'input[name*="phone" i]', 'input[name*="mobile" i]',
+    'input[id*="phone" i]', 'input[id*="mobile" i]', 'input[placeholder*="phone" i]',
+    'input[placeholder*="mobile" i]'))
+_CODE_FIELD = ", ".join(f"{sel}:visible" for sel in (
+    'input[autocomplete="one-time-code"]', 'input[name*="otp" i]', 'input[name*="code" i]',
+    'input[id*="otp" i]', 'input[id*="code" i]', 'input[placeholder*="otp" i]',
+    'input[placeholder*="code" i]', 'input[inputmode="numeric"]', 'input[type="number"]'))
+_OTP_SUBMIT = re.compile(r"(send|get|request)\s*(otp|code)|continue|next|submit|verify|log\s?in|sign\s?in", re.I)
+# The whole label of a control that is not a <button> - React Native Web and similar apps render a
+# clickable <div> ("Send code", "Verify and sign in") - so "New here? Sign up" never matches.
+_OTP_ACTION_LABEL = re.compile(
+    r"^\s*((send|get|request|text)( me)?( a| the| my)?\s*(otp|code|one[- ]time code|verification code)"
+    r"|continue|next|submit|verify( and sign in| and log in)?|log\s?in|sign\s?in)\s*$", re.I)
+_CODE_ON_PAGE = re.compile(r"\b(?:code|otp)\b[^0-9\n]{0,24}(\d{4,8})\b", re.I)
+_FIXED_CODE = re.compile(r"^\d{4,8}$")
+OTP_STEP_TIMEOUT = 15_000  # ms: how long each step of a mobile-number sign-in waits for the next screen
+
+
+# A line the app shows when it refuses a step ("Too many OTP requests for this number...",
+# "No account found for this number.").
+_REFUSAL = re.compile(r"(?i)(too many|try again|wait|invalid|incorrect|not found|no account|expired|error|failed|blocked)")
+
+
+async def _app_message(page) -> str | None:
+    """The app's own explanation on screen after a refused step, or None when it shows none."""
+    try:
+        for line in (await page.inner_text("body")).splitlines():
+            line = line.strip()
+            if 8 <= len(line) <= 160 and _REFUSAL.search(line):
+                return line
+    except Exception:
+        pass
+    return None
+
+
+async def _submit_near(page, field) -> None:
+    """Clicks the submit control of the field's own form (or the page's, without one), else presses Enter."""
+    form = field.locator("xpath=ancestor::form[1]")
+    scope = form if await form.count() else page
+    button = scope.locator('button[type="submit"]:visible, input[type="submit"]:visible')
+    if not await button.count():
+        button = scope.locator("button:visible").filter(has_text=_OTP_SUBMIT)
+    if not await button.count():
+        # The innermost clickable element carrying the whole label: its wrappers carry the label too,
+        # and a heading ("SIGN IN") carries it without being a control.
+        labelled = page.get_by_text(_OTP_ACTION_LABEL).filter(visible=True)
+        for i in reversed(range(await labelled.count())):
+            candidate = labelled.nth(i)
+            if await candidate.evaluate(
+                    "e => getComputedStyle(e).cursor === 'pointer' || e.getAttribute('role') === 'button'"):
+                await candidate.click()
+                return
+    if await button.count():
+        await button.first.click()
+    else:
+        await field.press("Enter")
+
+
+async def _otp_sign_in(page, credentials: dict) -> str | None:
+    """Signs in with a mobile number and a one-time code. None when it worked, else what went wrong.
+
+    Raises _NoLoginForm when the page has no phone field, so the caller reports a missing form.
+    """
+    phone = page.locator(_PHONE_FIELD)
+    if not await phone.count():
+        raise _NoLoginForm()
+    await phone.first.fill(credentials.get("username", ""))
+    await _submit_near(page, phone.first)
+    code_field = page.locator(_CODE_FIELD)
+    try:
+        await code_field.first.wait_for(state="visible", timeout=OTP_STEP_TIMEOUT)
+    except Exception:
+        said = await _app_message(page)
+        return ("the mobile number was entered and sent, but no field for the one-time code appeared "
+                f"within {OTP_STEP_TIMEOUT // 1000}s" + (f' - the app says: "{said}"' if said else " - check the number"))
+    written = (credentials.get("password") or "").strip()
+    code = written if _FIXED_CODE.match(written) else None
+    if code is None:
+        shown = _CODE_ON_PAGE.search(await page.inner_text("body"))
+        code = shown.group(1) if shown else None
+    if code is None:
+        return ("this app signs in with a one-time code sent to the phone, and the code is neither shown "
+                "on the page nor given as the login's password - use a test number whose code is fixed "
+                "and put that code in the password")
+    boxes = await code_field.count()
+    single_digit = boxes >= len(code) and (await code_field.first.get_attribute("maxlength")) == "1"
+    if single_digit:
+        await code_field.first.click()
+        await page.keyboard.type(code, delay=60)
+    else:
+        await code_field.first.fill(code)
+    start_url = page.url
+    await _submit_near(page, code_field.first)
+    try:
+        await page.wait_for_url(lambda u: u != start_url, timeout=OTP_STEP_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        await page.locator(_CODE_FIELD).first.wait_for(state="detached", timeout=OTP_STEP_TIMEOUT)
+    except Exception:
+        pass
+    if await page.locator(_CODE_FIELD).count() or page.url == start_url:
+        said = await _app_message(page)
+        return ("the one-time code was entered but the app stayed on the code screen"
+                + (f' - the app says: "{said}"' if said else " - the code was most likely rejected"))
+    return None
 
 
 class _GotoFailed(Exception):
@@ -255,7 +401,14 @@ async def _extract_locators(page: Page) -> list[dict]:
     position for every row action (.../tbody[1]/tr[2]) and a chain of styling classes for icon
     buttons - each passed validation at capture time and failed at run time, until healing put a
     stable selector in their place. The candidates now prefer what does not change between loads.
+
+    Clickable plain elements (React Native Web's controls) are captured too, as buttons, once
+    _MARK_PRESSABLES_JS has marked them.
     """
+    try:
+        await page.evaluate(_MARK_PRESSABLES_JS, MAX_LOCATOR_TEXT)
+    except Exception:
+        pass
     return await page.evaluate(r"""(MAX_TEXT) => {
         // Generated by UI libraries per render: Radix (radix-:r11:), React useId (:r5:), MUI, Headless
         // UI, Ember, ExtJS, and ids carrying a counter or hash.
@@ -314,7 +467,7 @@ async def _extract_locators(page: Page) -> list[dict]:
 
         const elements = [];
         document.querySelectorAll(
-            'a, button, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="combobox"], [onclick]'
+            'a, button, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [role="combobox"], [onclick], [data-crawl-pressable]'
         ).forEach((el) => {
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
@@ -355,7 +508,8 @@ async def _extract_locators(page: Page) -> list[dict]:
             add('xpath', positional, 'position');
 
             elements.push({
-                tag: t,
+                // A pressable <div> is a button to whoever reads this; its locators still name the real tag.
+                tag: el.hasAttribute('data-crawl-pressable') ? 'button' : t,
                 type: el.getAttribute('type') || null,
                 // innerText is what the user SEES, after CSS. textContent is what a text-based
                 // locator has to match. They differ whenever text-transform is in play — an
@@ -766,6 +920,18 @@ async def _expand_navigation(page, seen: set, deadline: float = None) -> tuple[d
     return revealed, opened
 
 
+async def _nav_selector(page) -> str:
+    """The navigation's buttons; in an app with none (every control a clickable <div>), its pressables."""
+    try:
+        if await page.locator(NAV_ITEM_SELECTOR).count():
+            return NAV_ITEM_SELECTOR
+        if await page.evaluate(_MARK_PRESSABLES_JS, MAX_LOCATOR_TEXT):
+            return PRESSABLE_SELECTOR
+    except Exception:
+        pass
+    return NAV_ITEM_SELECTOR
+
+
 async def _nav_item_labels(page, selector: str = None) -> list:
     labels = []
     items = page.locator(selector or NAV_ITEM_SELECTOR)
@@ -777,8 +943,12 @@ async def _nav_item_labels(page, selector: str = None) -> list:
             label = ((await item.get_attribute("aria-label")) or (await item.inner_text())).strip()
         except Exception:
             continue
-        if label and len(label) <= MAX_LOCATOR_TEXT and not NAV_SKIP.search(label) and label not in labels:
-            labels.append(label)
+        if (not label or len(label) > MAX_LOCATOR_TEXT or NAV_SKIP.search(label) or label in labels
+                or not re.search(r"\w", label, re.ASCII)):
+            continue
+        if selector == PRESSABLE_SELECTOR and PRESSABLE_ACTION_SKIP.search(label):
+            continue
+        labels.append(label)
     return labels
 
 
@@ -806,18 +976,32 @@ async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) ->
     start = page.url
     found = []
 
+    # Fast on purpose: every item is clicked and returned from, and a full reload plus a wait for the
+    # network to go quiet (which an app that polls never does) cost ~25 s an item - a ten-item
+    # sidebar spent the crawl's whole budget and none of the pages it found were visited.
     async def back() -> None:
-        await _goto(page, start)
-        await _settle(page)
-        await _dismiss_overlays(page)
+        try:
+            await page.go_back(timeout=NAV_STEP_TIMEOUT)
+        except Exception:
+            pass
+        if page.url != start:
+            await _goto(page, start)
+            await _settle(page)
+        else:
+            await page.wait_for_timeout(NAV_RENDER_WAIT)
+        await _dismiss_overlays(page, watch_ms=0)
 
     async def click(item) -> bool:
         try:
             await item.click(timeout=5_000)
-            await _settle(page)
-            return True
         except Exception:
             return False
+        try:
+            # A navigation item changes the address; a menu opener draws its menu in place.
+            await page.wait_for_url(lambda u: u != start, timeout=NAV_STEP_TIMEOUT)
+        except Exception:
+            await page.wait_for_timeout(NAV_RENDER_WAIT)
+        return True
 
     async def landed() -> bool:
         if page.url == start:
@@ -837,13 +1021,18 @@ async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) ->
     def out_of_time() -> bool:
         return deadline is not None and asyncio.get_running_loop().time() > deadline
 
-    for label in await _nav_item_labels(page):
+    # Re-read after every return to the start page: the reload drops the pressable marks.
+    for label in await _nav_item_labels(page, await _nav_selector(page)):
         if out_of_time():
             break
         if label in tried or len(tried) >= MAX_NAV_CLICKS:
             continue
         tried.add(label)
-        item = await _nav_item(page, label)
+        item = await _nav_item(page, label, await _nav_selector(page))
+        if item is None:
+            # The start page may still be redrawing after Back.
+            await page.wait_for_timeout(NAV_RENDER_WAIT)
+            item = await _nav_item(page, label, await _nav_selector(page))
         if item is None or not await click(item) or await landed():
             continue
         for entry in await _nav_item_labels(page, MENU_ITEM_SELECTOR):
@@ -855,7 +1044,7 @@ async def _pages_behind_nav_buttons(page, tried: set, deadline: float = None) ->
             menu_item = await _nav_item(page, entry, MENU_ITEM_SELECTOR)
             if menu_item is not None and await click(menu_item) and await landed():
                 # Back on the start page with the menu closed: reopened for its next item.
-                opener = await _nav_item(page, label)
+                opener = await _nav_item(page, label, await _nav_selector(page))
                 if opener is None or not await click(opener):
                     break
         # A panel or menu opened in place: closed so it cannot cover the next button.
@@ -986,7 +1175,11 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                 # strict-mode click throws on the ambiguity, and the bare except below swallowed
                 # it silently, so the form was never actually submitted despite no visible error.
                 if not login_form:
-                    raise _NoLoginForm()
+                    # No password form: a mobile-number sign-in, when the page has a phone field.
+                    problem = await _otp_sign_in(login_page, credentials)
+                    auth["succeeded"] = problem is None
+                    auth["detail"] = problem
+                    raise _OtpSignInDone()
                 form = login_page.locator('[data-crawl-login="form"]')
                 password_field = login_page.locator('[data-crawl-login="password"]')
                 await login_page.locator('[data-crawl-login="username"]').first.fill(
@@ -1044,6 +1237,8 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                         "credentials were most likely rejected")
                 elif auth["detail"] is None:
                     auth["succeeded"] = True
+            except _OtpSignInDone:
+                pass
             except _NoLoginForm:
                 auth["detail"] = (
                     "no sign-in form was found - not on this page and not behind a 'Log in' / "
