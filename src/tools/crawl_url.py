@@ -1164,6 +1164,34 @@ def _preferred(url: str, prefer_paths: list) -> bool:
     return any(str(p).lower() in path for p in prefer_paths if p)
 
 
+# A path segment that names one record rather than a section: an id, a uuid, a long hex/number.
+_ID_SEGMENT = re.compile(r"^(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$", re.I)
+
+
+def _page_kind(url: str) -> tuple:
+    """What kind of page a URL is: its first section word and its depth, ids skipped.
+
+    "/collections/matte-lipstick" and "/collections/crayon-lipsticks" are one kind (a listing),
+    "/products/x" another; "/contacts" and "/clients" are two. An app whose sections sit behind
+    ids ("/<uuid>/<uuid>/dashboard") still counts each section as its own kind."""
+    segments = [s for s in (urlparse(url).path or "/").lower().split("/") if s and not _ID_SEGMENT.match(s)]
+    if not segments:
+        return ("", 0)
+    return (segments[0], len(segments)) if len(segments) > 1 else (segments[0], 1)
+
+
+def _diverse_order(queue: list, kinds_seen: dict, prefer_paths: list = None) -> list:
+    """The queue with kinds of page not visited yet first, so a crawl of a store sees its listing,
+    a product, the cart and search instead of five listings in a row. Only the order changes:
+    within a kind, and among pages of kinds equally often seen, the order found is kept, and pages
+    the caller asked for first stay first."""
+    def key(u):
+        if prefer_paths and _preferred(u, prefer_paths):
+            return (0, 0)
+        return (1, kinds_seen.get(_page_kind(u), 0))
+    return sorted(queue, key=key)
+
+
 def _openers(open_by_clicking, open_each) -> list:
     """
     The click paths to capture, one page entry each. open_by_clicking alone is one path, as it has
@@ -1355,6 +1383,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             await login_page.close()
 
         queue = [url]
+        kinds_seen: dict = {}
         if post_login_url and _dedup_key(post_login_url) != _dedup_key(url):
             queue.insert(0, post_login_url)
         if pre_auth_page:
@@ -1375,6 +1404,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
             page_deadline = deadline
             if _dedup_key(current_url) in visited:
                 continue
+            kinds_seen[_page_kind(current_url)] = kinds_seen.get(_page_kind(current_url), 0) + 1
             visited.add(_dedup_key(current_url))
 
             if hosted:
@@ -1468,9 +1498,9 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     ):
                         queue.append(link)
                 # Pages the caller asked for first (a store's /collections/ listings for a search and
-                # filter test) jump the queue, in the order found; the rest keep theirs.
-                if prefer_paths:
-                    queue.sort(key=lambda u: 0 if _preferred(u, prefer_paths) else 1)
+                # filter test) jump the queue, in the order found; behind them, kinds of page not
+                # visited yet come before more of a kind already seen.
+                queue[:] = _diverse_order(queue, kinds_seen, prefer_paths)
 
                 await page.close()
 
