@@ -1,5 +1,6 @@
 import asyncio
 import re
+import sys
 import time
 
 from urllib.parse import urlparse
@@ -9,6 +10,38 @@ from src.config.ahq_services import settings
 from src.tools.open_by_clicking import open_by_clicking as _open_by_clicking
 from src.tools.browser_setup import ensure_chromium, is_missing_browser_error
 from src.tools.url_guard import validate_public_http_url
+
+# The container's memory as the kernel counts it for the OOM killer: cgroup v2, then v1.
+_CGROUP_MEMORY = (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                  ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+
+
+def _memory_note() -> str:
+    """'memory 812 MiB of 1024 MiB (79%)' in a container; '' where there is no cgroup (local runs)."""
+    for used_file, limit_file in _CGROUP_MEMORY:
+        try:
+            with open(used_file) as f:
+                used = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        try:
+            with open(limit_file) as f:
+                raw = f.read().strip()
+            limit = None if raw == "max" else int(raw)
+        except (OSError, ValueError):
+            limit = None
+        mib = used // (1024 * 1024)
+        if limit and limit < 1 << 60:
+            return f"memory {mib} MiB of {limit // (1024 * 1024)} MiB ({used * 100 // limit}%)"
+        return f"memory {mib} MiB"
+    return ""
+
+
+def _crawl_log(message: str) -> None:
+    """One line per crawl event, flushed at once: when the container is killed mid-crawl (out of
+    memory), the last lines before the restart are what say which page it was on and how full it was."""
+    note = _memory_note()
+    print(f"[crawl] {message}{' | ' + note if note else ''}", file=sys.stderr, flush=True)
 
 MAX_PAGES = 20
 # Ceiling on what a caller may ask for. A hosted crawl holds a headless Chromium for its whole run,
@@ -698,9 +731,14 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
         if blocked:
             return {"error": blocked}
 
+    site = _log_url(url)
+    asked_at = time.monotonic()
+    _crawl_log(f"{site}: asked for, up to {max_pages} pages, sign-in {'yes' if credentials else 'no'}")
     async with _CRAWL_SEMAPHORE:
+        _crawl_log(f"{site}: started after {time.monotonic() - asked_at:.0f}s waiting for a browser")
         deadline = caller_deadline or asyncio.get_running_loop().time() + settings.ahq_mcp_crawl_time_budget_s
         if asyncio.get_running_loop().time() > deadline - MIN_PAGE_TIME_S:
+            _crawl_log(f"{site}: no time left after waiting for a browser")
             return {"error": "Every crawl browser was busy for the whole time this crawl was given, so no page "
                              "was opened.",
                     "transient": True, "retry_note": "Try the same crawl again in a minute."}
@@ -710,19 +748,39 @@ async def crawl_url(url: str, credentials: dict = None, max_pages: int = MAX_PAG
                        progress=progress)
         try:
             if caller_deadline is None:
-                return await crawl
-            # A caller with a budget gets the pages finished in it even when one page hangs: the
-            # crawl only starts a page with time left, but that page can run far past the budget,
-            # and the caller then gave up on the whole crawl - every finished page lost with it.
-            left = max(1.0, deadline - asyncio.get_running_loop().time())
-            try:
-                return await asyncio.wait_for(crawl, timeout=left + OVERRUN_GRACE_S)
-            except asyncio.TimeoutError:
-                return _partial_result(progress, round(left + OVERRUN_GRACE_S))
+                result = await crawl
+            else:
+                # A caller with a budget gets the pages finished in it even when one page hangs: the
+                # crawl only starts a page with time left, but that page can run far past the budget,
+                # and the caller then gave up on the whole crawl - every finished page lost with it.
+                left = max(1.0, deadline - asyncio.get_running_loop().time())
+                try:
+                    result = await asyncio.wait_for(crawl, timeout=left + OVERRUN_GRACE_S)
+                except asyncio.TimeoutError:
+                    result = _partial_result(progress, round(left + OVERRUN_GRACE_S))
+                    _crawl_log(f"{site}: out of time after {time.monotonic() - asked_at:.0f}s, "
+                               f"returning {len(progress.get('pages', []))} page(s) captured so far")
+                    return result
+            pages = result.get("pages", []) if isinstance(result, dict) else []
+            _crawl_log(f"{site}: finished in {time.monotonic() - asked_at:.0f}s, "
+                       f"{len([p for p in pages if 'error' not in p])} page(s) captured, "
+                       f"{len([p for p in pages if 'error' in p])} failed"
+                       + (f", error: {result['error']}" if isinstance(result, dict) and result.get("error") else ""))
+            return result
         except _GotoFailed as failed:
             # The sign-in page itself never loaded, so nothing behind it could be reached.
+            _crawl_log(f"{site}: sign-in page never loaded: {failed}")
             return {"error": str(failed), "transient": True,
                     "retry_note": "The site did not respond, which is usually brief - try the same crawl again."}
+        except BaseException as e:
+            _crawl_log(f"{site}: failed after {time.monotonic() - asked_at:.0f}s: {type(e).__name__}: {e}")
+            raise
+
+
+def _log_url(url: str) -> str:
+    """Host and path only: a query string can carry a token, and logs are read by more people."""
+    parsed = urlparse(url or "")
+    return f"{parsed.netloc}{parsed.path}" or str(url)
 
 
 # Dialogs and panels open over the page on arrival - a welcome tour, a help panel, a cookie banner.
@@ -1325,6 +1383,7 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     pages_data.append({"url": current_url, "error": blocked})
                     continue
 
+            _crawl_log(f"{_log_url(url)}: page {len(pages_data) + 1} opening {_log_url(current_url)}")
             try:
                 page = await context.new_page()
                 pending = _PendingRequests(page)
@@ -1427,6 +1486,8 @@ async def _crawl(url: str, credentials: dict, max_pages: int, hosted: bool, foll
                     visited.discard(_dedup_key(current_url))
                     queue.insert(0, current_url)
                     continue
+                _crawl_log(f"{_log_url(url)}: page {_log_url(current_url)} failed: {type(e).__name__}: "
+                           f"{str(e).splitlines()[0][:200] if str(e) else ''}")
                 pages_data.append({"url": current_url, "error": str(e),
                                    "transient": _is_transient(e)})
 
