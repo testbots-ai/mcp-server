@@ -625,12 +625,24 @@ async def _batch_counts(page: Page, locators: list[dict]) -> dict:
 VALIDATION_CHUNK = 10
 
 
-def _validation_priority(loc: dict, label_counts: dict) -> tuple:
-    """Fields, then buttons, then navigation, then other links; a label repeated across the page
-    (a product grid's "+7 Shades" on every card) last, since one of its copies serves a test."""
+CHOICE_TYPES = ("radio", "checkbox")
+# More radios and checkboxes than this on one page are a product grid's swatches, not a form.
+MANY_CHOICES = 20
+
+
+def _validation_priority(loc: dict, label_counts: dict, many_choices: bool = False) -> tuple:
+    """Fields, then buttons, then navigation, then radios and checkboxes, then other links; a label
+    repeated across the page (a product grid's "+7 Shades" on every card) last, since one of its
+    copies serves a test. A storefront's colour swatches are radios with labels of their own
+    ("01 Bare Affair"): ranked as fields they took the whole budget and left the page no menu."""
     tag = (loc.get("tag") or "").lower()
-    kind = 0 if tag in ("input", "select", "textarea") else 1 if tag == "button" or loc.get("role") == "button" else \
-        2 if any(region in (loc.get("xpath") or "").lower() for region in ("/nav", "/header", "/aside")) else 3
+    choice = tag == "input" and (loc.get("type") or "").lower() in CHOICE_TYPES
+    in_nav = any(region in (loc.get("xpath") or "").lower() for region in ("/nav", "/header", "/aside"))
+    if choice:
+        kind = 4 if many_choices else 3
+    else:
+        kind = 0 if tag in ("input", "select", "textarea") else 1 if tag == "button" or loc.get("role") == "button" else \
+            2 if in_nav else 3
     label = (loc.get("text") or loc.get("ariaLabel") or "").strip().lower()
     return (1 if label and label_counts.get(label, 0) > 3 else 0, kind)
 
@@ -666,7 +678,9 @@ async def _validate_locators(page: Page, locators: list[dict], deadline: float =
             if label:
                 label_counts[label] = label_counts.get(label, 0) + 1
         page_order = {id(loc): i for i, loc in enumerate(locators)}
-        locators = sorted(locators, key=lambda loc: _validation_priority(loc, label_counts))
+        many_choices = sum(1 for loc in locators if (loc.get("tag") or "").lower() == "input"
+                           and (loc.get("type") or "").lower() in CHOICE_TYPES) > MANY_CHOICES
+        locators = sorted(locators, key=lambda loc: _validation_priority(loc, label_counts, many_choices))
         loop = asyncio.get_running_loop()
         counts, checked = {}, 0
         while checked < len(locators) and loop.time() < deadline:
