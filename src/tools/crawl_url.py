@@ -557,6 +557,13 @@ async def _extract_locators(page: Page) -> list[dict]:
                     return (tt && tt !== 'none') ? tt : null;
                 })(),
                 ariaLabel: el.getAttribute('aria-label') || null,
+                // Where a link really goes (absolute; "mailto:"/"tel:" kept as written), so a test can
+                // check the page it opens instead of guessing from the link's text. A button wrapped in a
+                // link goes where the link goes.
+                href: (function () {
+                    var a = el.closest('a[href]');
+                    return a && a.getAttribute('href') ? a.href : null;
+                })(),
                 placeholder: el.getAttribute('placeholder') || null,
                 label: label || null,
                 inDialog: !!el.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"],dialog[open]'),
